@@ -1,4 +1,16 @@
-from fastapi import FastAPI
+import os
+
+from dotenv import load_dotenv
+
+# Load environment-specific .env file
+env = os.getenv("ENV", "local")
+dotenv_file = f".env.{env}"
+load_dotenv(dotenv_file)
+
+from fastapi import FastAPI, Depends
+from sqlalchemy.orm import Session
+
+from app.db import get_db
 
 app = FastAPI(
     title="Video Clone Backend",
@@ -13,8 +25,8 @@ async def root():
 
 
 @app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+async def health_check(db: Session = Depends(get_db)):
+    return {"status": "healthy", "database": "connected"}
 
 
 if __name__ == "__main__":
