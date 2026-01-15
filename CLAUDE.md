@@ -15,6 +15,15 @@ uv sync
 
 # Add a new dependency
 uv add <package-name>
+
+# Run database migrations
+ENV=local alembic upgrade head
+
+# Create a new migration
+ENV=local alembic revision --autogenerate -m "Description"
+
+# Check migration status
+ENV=local alembic current
 ```
 
 ## Environment Configuration
@@ -29,6 +38,7 @@ Set `ENV=local` (default) to use `.env.local`.
 Required environment variables:
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` - PostgreSQL connection
 - `S3_AWS_REGION`, `S3_AWS_ACCESS_KEY_ID`, `S3_AWS_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` - AWS S3 configuration
+- `FIREBASE_CREDENTIALS_FILE` - Path to Firebase service account JSON file
 
 ## Architecture
 
@@ -37,14 +47,22 @@ Required environment variables:
 **Structure:**
 ```
 main.py              # App entry point, loads env files before imports
+alembic/             # Database migrations
+  env.py             # Migration environment config
+  versions/          # Migration files
 app/
   config.py          # Pydantic Settings for typed configuration
   db/
     database.py      # SQLAlchemy engine, session factory, Base
     __init__.py      # Exports: get_db, get_db_session, engine, SessionLocal, Base
   models/
+    user.py          # User model (firebase_uid, email, name, timestamps)
     __init__.py      # Import models here, exports Base
   services/
+    firebase/
+      firebase_config.py  # Firebase initialization with JSON credentials
+      firebase_auth.py    # Auth middleware: get_current_user, verify_token
+      __init__.py         # Exports auth dependencies
     s3/
       s3_config.py   # S3Settings (Pydantic) with S3_ env prefix
       s3_service.py  # S3Service: upload, presigned URLs, delete, etc.
@@ -85,3 +103,25 @@ await s3_service.delete_file("videos/user123/video.mp4")
 # Generate S3 key helper
 s3_key = s3_service.generate_s3_key("user123", "video.mp4", media_type="videos")
 ```
+
+**Firebase Auth Usage:**
+```python
+from fastapi import Depends
+from app.services.firebase import get_current_user, get_current_user_or_create
+from app.models import User
+
+# Protected route - requires existing user
+@router.get("/profile")
+async def get_profile(user: User = Depends(get_current_user)):
+    return {"email": user.email, "name": user.name}
+
+# Auto-create user on first login
+@router.post("/login")
+async def login(user: User = Depends(get_current_user_or_create)):
+    return {"message": "Welcome", "user_id": user.id}
+```
+
+**Firebase Setup:**
+1. Download service account JSON from Firebase Console
+2. Save as `firebase-credentials-dev.json` (local) or `firebase-credentials.json` (production)
+3. Set `FIREBASE_CREDENTIALS_FILE` in `.env.{ENV}` if using custom path

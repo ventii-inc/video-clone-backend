@@ -38,3 +38,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# Firebase credentials
+firebase-credentials*.json
