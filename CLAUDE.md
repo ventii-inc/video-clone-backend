@@ -125,3 +125,19 @@ async def login(user: User = Depends(get_current_user_or_create)):
 1. Download service account JSON from Firebase Console
 2. Save as `firebase-credentials-dev.json` (local) or `firebase-credentials.json` (production)
 3. Set `FIREBASE_CREDENTIALS_FILE` in `.env.{ENV}` if using custom path
+
+## AWS Database Commands
+
+**Staging Aurora Serverless (Tokyo):**
+```bash
+# Start the staging database
+aws rds start-db-cluster --region ap-northeast-1 --db-cluster-identifier video-clone-stg-cluster
+
+# Stop the staging database
+aws rds stop-db-cluster --region ap-northeast-1 --db-cluster-identifier video-clone-stg-cluster
+
+# Check database status
+aws rds describe-db-clusters --region ap-northeast-1 --db-cluster-identifier video-clone-stg-cluster --query 'DBClusters[0].Status' --output text
+```
+
+Note: Aurora automatically restarts stopped clusters after 7 days.
