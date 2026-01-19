@@ -29,7 +29,8 @@ class VideoModel(Base):
     name = Column(String(100), nullable=False)
     source_video_url = Column(String(500), nullable=True)
     source_video_key = Column(String(500), nullable=True)  # S3 key
-    model_data_url = Column(String(500), nullable=True)  # Processed model from AI
+    model_data_url = Column(String(500), nullable=True)  # Presigned URL for model data
+    model_data_key = Column(String(500), nullable=True)  # S3 key for avatar TAR file
     thumbnail_url = Column(String(500), nullable=True)
     duration_seconds = Column(Integer, nullable=True)
     file_size_bytes = Column(Integer, nullable=True)

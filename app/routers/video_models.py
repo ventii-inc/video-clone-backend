@@ -22,6 +22,7 @@ from app.schemas.video_model import (
     VideoModelUpdate,
     VideoModelCreateResponse,
     UploadCompleteRequest,
+    AvatarReadyRequest,
 )
 from app.schemas.common import UploadInfo
 
@@ -143,7 +144,7 @@ async def create_video_model(
     s3_key = s3_service.generate_s3_key(
         user_id=str(user.id),
         filename=data.file_name,
-        media_type="video-models",
+        media_type="training-videos",
         unique_id=str(model.id),
     )
 
@@ -234,6 +235,62 @@ async def process_video_model_task(model_id: UUID):
 
     async with get_db_session() as db:
         await ai_service.process_video_model(model_id, db)
+
+
+@router.post("/{model_id}/avatar-ready", response_model=dict)
+async def avatar_ready(
+    model_id: UUID,
+    data: AvatarReadyRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Callback endpoint for avatar backend to notify when TAR file is uploaded.
+
+    Called by the avatar processing service after it uploads the avatar TAR to S3.
+    This marks the video model as completed and ready for video generation.
+
+    Note: This endpoint is intended for internal service-to-service communication.
+    Consider adding API key authentication for production use.
+    """
+    from datetime import datetime
+
+    result = await db.execute(
+        select(VideoModel).where(VideoModel.id == model_id)
+    )
+    model = result.scalar_one_or_none()
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Video model not found",
+        )
+
+    if model.status not in [ModelStatus.PROCESSING.value, ModelStatus.UPLOADING.value]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot update avatar for model in '{model.status}' status",
+        )
+
+    # Verify the TAR file exists in S3
+    exists = await s3_service.file_exists(data.s3_key)
+    if not exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Avatar TAR file not found in S3",
+        )
+
+    # Update model with avatar data
+    model.model_data_key = data.s3_key
+    model.status = ModelStatus.COMPLETED.value
+    model.processing_completed_at = datetime.utcnow()
+    await db.commit()
+
+    return {
+        "message": "Avatar ready, model marked as completed",
+        "model_id": str(model.id),
+        "model_data_key": model.model_data_key,
+        "status": model.status,
+    }
 
 
 @router.patch("/{model_id}", response_model=VideoModelResponse)

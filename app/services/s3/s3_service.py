@@ -304,6 +304,40 @@ class S3Service:
             logger.error(f"Unexpected error checking if {s3_key} exists: {e}", exc_info=True)
             return False
 
+    async def download_file(self, s3_key: str, local_path: str) -> bool:
+        """
+        Download a file from S3 to local filesystem.
+
+        Args:
+            s3_key: S3 key of the file to download
+            local_path: Local path where the file will be saved
+
+        Returns:
+            True if download successful, False otherwise
+
+        Raises:
+            ClientError: If S3 download fails
+        """
+        try:
+            session, config = self._get_session()
+            async with session.client("s3", config=config) as s3_client:
+                logger.info(f"Downloading s3://{self.bucket_name}/{s3_key} to {local_path}")
+
+                await s3_client.download_file(self.bucket_name, s3_key, local_path)
+
+                logger.info(f"Successfully downloaded {s3_key} to {local_path}")
+                return True
+
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                logger.error(f"File not found in S3: {s3_key}")
+            else:
+                logger.error(f"Failed to download {s3_key} from S3: {e}", exc_info=True)
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error downloading {s3_key} from S3: {e}", exc_info=True)
+            return False
+
     async def delete_file(self, s3_key: str) -> bool:
         """
         Delete a file from S3
@@ -388,19 +422,30 @@ class S3Service:
 
         return content_types.get(extension, "application/octet-stream")
 
-    def generate_s3_key(self, prefix: str, filename: str, media_type: str = "videos") -> str:
+    def generate_s3_key(
+        self,
+        user_id: str,
+        filename: str,
+        media_type: str = "training-videos",
+        unique_id: str = None,
+    ) -> str:
         """
-        Generate a consistent S3 key for media files
+        Generate a consistent S3 key for media files.
 
         Args:
-            prefix: Prefix for the key (e.g., user_id, video_id)
+            user_id: User ID for the folder structure
             filename: Original filename
-            media_type: Type of media (videos, audios, images, thumbnails)
+            media_type: Type of media (training-videos, avatars, generated-videos)
+            unique_id: Optional unique ID (model_id or video_id) to include in filename
 
         Returns:
-            S3 key in format: {media_type}/{prefix}/{filename}
+            S3 key in format: {media_type}/{user_id}/{unique_id}{ext} or {media_type}/{user_id}/{filename}
         """
-        return f"{media_type}/{prefix}/{filename}"
+        if unique_id:
+            # Use unique_id as the filename base, preserving original extension
+            ext = os.path.splitext(filename)[1] if filename else ".mp4"
+            filename = f"{unique_id}{ext}"
+        return f"{media_type}/{user_id}/{filename}"
 
 
 # Create singleton instance

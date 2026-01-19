@@ -29,6 +29,11 @@ class UploadCompleteRequest(BaseModel):
     duration_seconds: int = Field(..., gt=0, description="Video duration in seconds")
 
 
+class AvatarReadyRequest(BaseModel):
+    """Request from avatar backend when TAR file is uploaded"""
+    s3_key: str = Field(..., description="S3 key of the uploaded avatar TAR file")
+
+
 class VideoModelResponse(BaseModel):
     """Video model response"""
     id: UUID
