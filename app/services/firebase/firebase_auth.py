@@ -6,7 +6,8 @@ from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
 from firebase_admin import auth
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.models.user import User
@@ -90,7 +91,7 @@ def get_token_from_header(request: Request) -> str:
 
 
 async def get_current_user(
-    request: Request, db: Session = Depends(get_db)
+    request: Request, db: AsyncSession = Depends(get_db)
 ) -> User:
     """
     FastAPI dependency to get the current authenticated user.
@@ -103,7 +104,7 @@ async def get_current_user(
 
     Args:
         request: The FastAPI request object
-        db: SQLAlchemy database session
+        db: SQLAlchemy async database session
 
     Returns:
         User: The authenticated user
@@ -120,16 +121,18 @@ async def get_current_user(
         )
 
     # Look up user by Firebase UID
-    user = db.query(User).filter(User.firebase_uid == token_data.uid).first()
+    result = await db.execute(select(User).where(User.firebase_uid == token_data.uid))
+    user = result.scalar_one_or_none()
 
     if not user:
         # Check if user exists by email (could have been created differently)
-        user = db.query(User).filter(User.email == token_data.email).first()
+        result = await db.execute(select(User).where(User.email == token_data.email))
+        user = result.scalar_one_or_none()
 
         if user:
             # Update firebase_uid if user exists but uid doesn't match
             user.firebase_uid = token_data.uid
-            db.commit()
+            await db.commit()
         else:
             raise HTTPException(
                 status_code=404, detail="User not found. Please register first."
@@ -139,7 +142,7 @@ async def get_current_user(
 
 
 async def get_current_user_or_create(
-    request: Request, db: Session = Depends(get_db)
+    request: Request, db: AsyncSession = Depends(get_db)
 ) -> User:
     """
     FastAPI dependency to get or create the current authenticated user.
@@ -148,7 +151,7 @@ async def get_current_user_or_create(
 
     Args:
         request: The FastAPI request object
-        db: SQLAlchemy database session
+        db: SQLAlchemy async database session
 
     Returns:
         User: The authenticated user (existing or newly created)
@@ -165,11 +168,13 @@ async def get_current_user_or_create(
         )
 
     # Look up user by Firebase UID
-    user = db.query(User).filter(User.firebase_uid == token_data.uid).first()
+    result = await db.execute(select(User).where(User.firebase_uid == token_data.uid))
+    user = result.scalar_one_or_none()
 
     if not user:
         # Check if user exists by email
-        user = db.query(User).filter(User.email == token_data.email).first()
+        result = await db.execute(select(User).where(User.email == token_data.email))
+        user = result.scalar_one_or_none()
 
         if user:
             # Update firebase_uid if user exists but uid doesn't match
@@ -183,14 +188,14 @@ async def get_current_user_or_create(
             )
             db.add(user)
 
-        db.commit()
-        db.refresh(user)
+        await db.commit()
+        await db.refresh(user)
 
     return user
 
 
 async def get_optional_user(
-    request: Request, db: Session = Depends(get_db)
+    request: Request, db: AsyncSession = Depends(get_db)
 ) -> Optional[User]:
     """
     FastAPI dependency to optionally get the current user.
@@ -199,7 +204,7 @@ async def get_optional_user(
 
     Args:
         request: The FastAPI request object
-        db: SQLAlchemy database session
+        db: SQLAlchemy async database session
 
     Returns:
         Optional[User]: The authenticated user or None
@@ -216,7 +221,8 @@ async def get_optional_user(
         if not token_data.email:
             return None
 
-        user = db.query(User).filter(User.firebase_uid == token_data.uid).first()
+        result = await db.execute(select(User).where(User.firebase_uid == token_data.uid))
+        user = result.scalar_one_or_none()
         return user
     except HTTPException:
         return None
