@@ -41,3 +41,5 @@ htmlcov/
 
 # Firebase credentials
 firebase-credentials*.json
+firebase.json
+firebase-staging.json

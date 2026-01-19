@@ -197,6 +197,36 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 
 ---
 
+### Avatar Streaming
+
+Real-time avatar video streaming with lip-sync capabilities via LiveTalking integration.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/avatar/session` | Yes | Get WebRTC connection URLs |
+| POST | `/avatar/send-text` | Yes | Send text for TTS |
+| POST | `/avatar/recording` | Yes | Start/stop recording |
+| POST | `/avatar/recording/download` | Yes | Download recording to S3 |
+| GET | `/avatar/health` | No | Check LiveTalking availability |
+
+**Send Text Request:**
+- `session_id` - WebRTC session ID (integer)
+- `text` - Text to speak (1-5000 chars)
+- `interrupt` - Interrupt current speech (default: true)
+
+**Recording Control Request:**
+- `session_id` - WebRTC session ID
+- `action` - "start" or "stop"
+
+**Download Response:**
+- `recording_id` - UUID of the recording
+- `download_url` - Presigned S3 URL
+- `s3_key` - S3 storage path
+
+> **See also:** [Avatar Streaming Documentation](./avatar-streaming.md) for detailed integration guide.
+
+---
+
 ### Health Check
 
 | Method | Path | Auth | Description |

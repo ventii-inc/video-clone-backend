@@ -39,69 +39,48 @@ Required environment variables:
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` - PostgreSQL connection
 - `S3_AWS_REGION`, `S3_AWS_ACCESS_KEY_ID`, `S3_AWS_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` - AWS S3 configuration
 - `FIREBASE_CREDENTIALS_FILE` - Path to Firebase service account JSON file
+- `SENTRY_DSN` (optional) - Sentry error tracking (disabled in debug mode)
+- `CORS_ORIGINS` (optional) - Comma-separated list of additional CORS origins
 
 ## Architecture
 
-**Stack:** FastAPI + SQLAlchemy 2.0 + PostgreSQL
+**Stack:** FastAPI + SQLAlchemy 2.0 (async) + PostgreSQL + Firebase Auth + S3
 
-**Structure:**
-```
-main.py              # App entry point, loads env files before imports
-alembic/             # Database migrations
-  env.py             # Migration environment config
-  versions/          # Migration files
-app/
-  config.py          # Pydantic Settings for typed configuration
-  db/
-    database.py      # SQLAlchemy engine, session factory, Base
-    __init__.py      # Exports: get_db, get_db_session, engine, SessionLocal, Base
-  models/
-    user.py          # User model (firebase_uid, email, name, timestamps)
-    __init__.py      # Import models here, exports Base
-  services/
-    firebase/
-      firebase_config.py  # Firebase initialization with JSON credentials
-      firebase_auth.py    # Auth middleware: get_current_user, verify_token
-      __init__.py         # Exports auth dependencies
-    s3/
-      s3_config.py   # S3Settings (Pydantic) with S3_ env prefix
-      s3_service.py  # S3Service: upload, presigned URLs, delete, etc.
-      __init__.py    # Exports: s3_service, S3Service, s3_settings
-```
+**API Pattern:**
+- All API routes are prefixed with `/api/v1` (defined in `app/utils/constants.py`)
+- Routers use tags for OpenAPI grouping
+- Authentication via Firebase token in `Authorization: Bearer <token>` header
+
+**Key Modules:**
+- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings)
+- `app/models/` - SQLAlchemy models (User, UserProfile, VideoModel, VoiceModel, GeneratedVideo, Subscription, etc.)
+- `app/schemas/` - Pydantic request/response schemas
+- `app/services/` - Business logic (firebase, s3, ai, usage_service)
+- `app/utils/` - Helpers (logger, constants, response_utils, sentry_utils)
+- `app/middleware/` - Performance monitoring middleware
 
 **Database Session Patterns:**
-- `get_db()` - FastAPI dependency for route injection (use with `Depends(get_db)`)
-- `get_db_session()` - Context manager for standalone operations (auto-commits on success, rolls back on error)
+- `get_db()` - Async FastAPI dependency for route injection (use with `Depends(get_db)`)
+- `get_db_session()` - Async context manager for standalone operations (auto-commits on success, rolls back on error)
+- `get_sync_db()` / `get_sync_db_session()` - Sync versions for non-async contexts (e.g., Alembic)
 
-**Adding New Models:**
-1. Create model file in `app/models/`
-2. Import the model in `app/models/__init__.py` to register with Base
-3. Models inherit from `Base` imported from `app.db`
+**Adding New Features:**
+1. Create model in `app/models/` → import in `app/models/__init__.py`
+2. Create schema in `app/schemas/` → import in `app/schemas/__init__.py`
+3. Create router in `app/routers/` → import in `app/routers/__init__.py` → register in `main.py`
+4. Run `ENV=local alembic revision --autogenerate -m "Description"` → `ENV=local alembic upgrade head`
 
-**S3 Service Usage:**
+**Response Utilities:**
 ```python
-from app.services.s3 import s3_service
+from app.utils.response_utils import success, error_response, not_found_error, validation_error
 
-# Upload a file
-await s3_service.upload_file("/path/to/file.mp4", "videos/user123/video.mp4")
+# Success response
+return success(data={"id": 123}, message="Created successfully")
 
-# Upload file object (from FastAPI UploadFile)
-await s3_service.upload_fileobj(file.file, "videos/user123/video.mp4", content_type="video/mp4")
-
-# Generate presigned URL for download/streaming
-url = await s3_service.generate_presigned_url("videos/user123/video.mp4")
-
-# Generate presigned URL for upload
-upload_url = await s3_service.generate_presigned_upload_url("videos/user123/video.mp4", content_type="video/mp4")
-
-# Check if file exists
-exists = await s3_service.file_exists("videos/user123/video.mp4")
-
-# Delete a file
-await s3_service.delete_file("videos/user123/video.mp4")
-
-# Generate S3 key helper
-s3_key = s3_service.generate_s3_key("user123", "video.mp4", media_type="videos")
+# Error responses
+return not_found_error("Video model")
+return validation_error("Invalid file type", details={"field": "video"})
+return error_response("CUSTOM_ERROR", "Something went wrong", status_code=400)
 ```
 
 **Firebase Auth Usage:**
@@ -120,6 +99,22 @@ async def get_profile(user: User = Depends(get_current_user)):
 async def login(user: User = Depends(get_current_user_or_create)):
     return {"message": "Welcome", "user_id": user.id}
 ```
+
+**S3 Service Usage:**
+```python
+from app.services.s3 import s3_service
+
+await s3_service.upload_file("/path/to/file.mp4", "videos/user123/video.mp4")
+await s3_service.upload_fileobj(file.file, "videos/user123/video.mp4", content_type="video/mp4")
+url = await s3_service.generate_presigned_url("videos/user123/video.mp4")
+upload_url = await s3_service.generate_presigned_upload_url("videos/user123/video.mp4", content_type="video/mp4")
+exists = await s3_service.file_exists("videos/user123/video.mp4")
+await s3_service.delete_file("videos/user123/video.mp4")
+s3_key = s3_service.generate_s3_key("user123", "video.mp4", media_type="videos")
+```
+
+**AI Service:**
+The `app/services/ai/ai_service.py` contains a mock implementation for video/voice model processing and video generation. Replace with actual AI API integrations in production.
 
 **Firebase Setup:**
 1. Download service account JSON from Firebase Console
