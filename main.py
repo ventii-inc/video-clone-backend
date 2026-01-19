@@ -32,6 +32,8 @@ from app.routers import (
     dashboard_router,
     billing_router,
     settings_router,
+    avatar_router,
+    avatar_backend_router,
 )
 
 # Initialize Sentry for error tracking (only in non-debug environments)
@@ -79,6 +81,8 @@ app.include_router(videos_router, prefix=API_PREFIX)
 app.include_router(dashboard_router, prefix=API_PREFIX)
 app.include_router(billing_router, prefix=API_PREFIX)
 app.include_router(settings_router, prefix=API_PREFIX)
+app.include_router(avatar_router, prefix=API_PREFIX)
+app.include_router(avatar_backend_router, prefix=API_PREFIX)
 
 
 @app.exception_handler(Exception)
@@ -116,7 +120,8 @@ async def health_check(db: AsyncSession = Depends(get_db)):
         # Try a simple query to verify database connection
         await db.execute(text("SELECT 1"))
         db_status = "connected"
-    except Exception:
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
         db_status = "disconnected"
 
     return {"status": "healthy", "database": db_status}

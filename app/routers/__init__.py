@@ -9,6 +9,8 @@ from app.routers.videos import router as videos_router
 from app.routers.dashboard import router as dashboard_router
 from app.routers.billing import router as billing_router
 from app.routers.settings import router as settings_router
+from app.routers.avatar import router as avatar_router
+from app.routers.avatar_backend import router as avatar_backend_router
 
 __all__ = [
     "auth_router",
@@ -20,4 +22,6 @@ __all__ = [
     "dashboard_router",
     "billing_router",
     "settings_router",
+    "avatar_router",
+    "avatar_backend_router",
 ]

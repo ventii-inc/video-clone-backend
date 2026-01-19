@@ -13,6 +13,8 @@ from app.models.video_model import ModelStatus
 from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.ai import ai_service
+from app.services.avatar_job import avatar_job_service
+from app.utils import logger
 from app.schemas.common import MessageResponse, PaginationMeta
 from app.schemas.video_model import (
     VideoModelCreate,
@@ -216,25 +218,33 @@ async def complete_upload(
     model.status = ModelStatus.UPLOADING.value
     await db.commit()
 
-    # Start AI processing in background
-    # Note: In production, this should use a proper job queue
+    # Create avatar generation job
+    job = await avatar_job_service.create_job(
+        video_model_id=model.id,
+        user_id=user.id,
+        db=db,
+    )
+
+    logger.info(f"Created avatar job {job.id} for video model {model.id}")
+
+    # Process pending jobs (will trigger this job if slots available)
     background_tasks.add_task(
-        process_video_model_task,
-        model_id=model.id,
+        process_avatar_jobs_task,
     )
 
     return {
         "model": VideoModelBrief.model_validate(model).model_dump(),
-        "message": "Video model is now being processed",
+        "job_id": str(job.id),
+        "message": "Video uploaded, avatar generation job queued",
     }
 
 
-async def process_video_model_task(model_id: UUID):
-    """Background task to process video model."""
+async def process_avatar_jobs_task():
+    """Background task to process pending avatar jobs."""
     from app.db import get_db_session
 
     async with get_db_session() as db:
-        await ai_service.process_video_model(model_id, db)
+        await avatar_job_service.process_pending_jobs(db)
 
 
 @router.post("/{model_id}/avatar-ready", response_model=dict)

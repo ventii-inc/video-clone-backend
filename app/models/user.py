@@ -32,6 +32,7 @@ class User(Base):
     generated_videos = relationship("GeneratedVideo", back_populates="user", cascade="all, delete-orphan")
     usage_records = relationship("UsageRecord", back_populates="user", cascade="all, delete-orphan")
     payment_history = relationship("PaymentHistory", back_populates="user", cascade="all, delete-orphan")
+    avatar_jobs = relationship("AvatarJob", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User(id={self.id}, email='{self.email}')>"

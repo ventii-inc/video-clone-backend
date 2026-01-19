@@ -44,6 +44,7 @@ class VideoModel(Base):
     # Relationships
     user = relationship("User", back_populates="video_models")
     generated_videos = relationship("GeneratedVideo", back_populates="video_model")
+    avatar_jobs = relationship("AvatarJob", back_populates="video_model", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<VideoModel(id={self.id}, name='{self.name}', status='{self.status}')>"
