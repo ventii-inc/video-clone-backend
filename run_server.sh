@@ -2,6 +2,9 @@
 
 # Server management script for RunPod deployment
 
+# Default to staging environment
+export ENV=${ENV:-staging}
+
 case "$1" in
     start)
         echo "Starting server..."
@@ -33,6 +36,7 @@ case "$1" in
         ;;
     *)
         echo "Usage: $0 {start|stop|restart|logs|status}"
+        echo "Environment: ENV=${ENV} (override with ENV=local $0 start)"
         exit 1
         ;;
 esac
