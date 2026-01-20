@@ -49,20 +49,10 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# CORS configuration
-origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3000",
-]
-
-# Add production origins from environment
-if os.getenv("CORS_ORIGINS"):
-    origins.extend(os.getenv("CORS_ORIGINS").split(","))
-
+# CORS configuration - allow all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
