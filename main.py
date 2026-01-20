@@ -45,8 +45,8 @@ app = FastAPI(
     title="Video Clone Backend",
     description="AI Clone Video Generation Service API",
     version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None,
+    redoc_url=None,
 )
 
 # CORS configuration
