@@ -24,6 +24,7 @@ from app.services.s3 import s3_service
 from app.services.video import video_service, get_video_duration
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
+from app.services.fish_audio import fish_audio_service
 
 logger = logging.getLogger(__name__)
 
@@ -179,12 +180,12 @@ class AIService:
         model_id: UUID,
         db: AsyncSession,
     ) -> None:
-        """Process a voice model (mock implementation).
+        """Process a voice model using Fish Audio voice cloning.
 
-        In production, this would:
+        Steps:
         1. Download source audio from S3
-        2. Send to AI API for voice cloning
-        3. Store trained model data
+        2. Send to Fish Audio API for voice cloning
+        3. Store the Fish Audio model ID for TTS generation
         """
         logger.info(f"Starting voice model processing: {model_id}")
 
@@ -203,16 +204,63 @@ class AIService:
         model.processing_started_at = datetime.utcnow()
         await db.commit()
 
-        # Simulate processing time
+        # Check if Fish Audio is configured
+        if not fish_audio_service.is_configured():
+            logger.warning("Fish Audio not configured, using mock mode")
+            await self._process_voice_model_mock(model, db)
+            return
+
+        try:
+            # Get presigned URL for the source audio
+            if not model.source_audio_key:
+                raise ValueError("No source audio key found")
+
+            audio_url = await s3_service.generate_presigned_url(
+                model.source_audio_key, expires_in=3600
+            )
+
+            # Clone voice using Fish Audio
+            clone_result = await fish_audio_service.clone_voice_from_url(
+                audio_url=audio_url,
+                title=model.name,
+                description=f"Voice model for user {model.user_id}",
+            )
+
+            if not clone_result.success:
+                raise ValueError(clone_result.error or "Voice cloning failed")
+
+            # Store Fish Audio model ID
+            model.status = VoiceModelStatus.COMPLETED.value
+            model.processing_completed_at = datetime.utcnow()
+            model.model_data_url = clone_result.model_id  # Store Fish Audio model ID
+
+            await db.commit()
+            logger.info(
+                f"Voice model processing completed: {model_id}, "
+                f"fish_audio_id={clone_result.model_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"Voice model processing failed: {e}")
+            model.status = VoiceModelStatus.FAILED.value
+            model.error_message = str(e)[:500]
+            model.processing_completed_at = datetime.utcnow()
+            await db.commit()
+
+    async def _process_voice_model_mock(
+        self,
+        model: VoiceModel,
+        db: AsyncSession,
+    ) -> None:
+        """Mock voice model processing for development."""
         await asyncio.sleep(self.VOICE_MODEL_PROCESSING_TIME)
 
-        # Mock success
         model.status = VoiceModelStatus.COMPLETED.value
         model.processing_completed_at = datetime.utcnow()
-        model.model_data_url = f"s3://mock-bucket/models/voice/{model_id}/model.bin"
+        model.model_data_url = f"mock://fish-audio/{model.id}"
 
         await db.commit()
-        logger.info(f"Voice model processing completed: {model_id}")
+        logger.info(f"Mock voice model processing completed: {model.id}")
 
     async def generate_video(
         self,
