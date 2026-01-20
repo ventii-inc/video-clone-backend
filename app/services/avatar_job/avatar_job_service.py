@@ -1,6 +1,7 @@
 """Avatar job service for managing the avatar generation queue"""
 
 import os
+import tempfile
 from datetime import datetime, timedelta
 from typing import List, Optional
 from uuid import UUID
@@ -13,6 +14,8 @@ from app.models import AvatarJob, VideoModel
 from app.models.avatar_job import JobStatus
 from app.models.video_model import ModelStatus
 from app.services.avatar_job.runpod_client import runpod_client
+from app.services.livetalking import livetalking_cli_service
+from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.s3 import s3_service
 from app.utils import logger
 
@@ -163,6 +166,11 @@ class AvatarJobService:
 
         return jobs_started
 
+    def _get_execution_mode(self) -> str:
+        """Get the execution mode (cli or api) from settings."""
+        settings = LiveTalkingSettings()
+        return settings.LIVETALKING_MODE
+
     async def trigger_job(self, job: AvatarJob, db: AsyncSession) -> bool:
         """
         Trigger a single job for processing.
@@ -190,16 +198,6 @@ class AvatarJobService:
             await self.mark_failed(job.id, "No source video uploaded", db)
             return False
 
-        # Generate presigned URL for the video
-        video_url = await s3_service.generate_presigned_url(
-            video_model.source_video_key, expiration=7200  # 2 hours
-        )
-
-        if not video_url:
-            logger.error(f"Could not generate presigned URL for job {job.id}")
-            await self.mark_failed(job.id, "Could not generate download URL", db)
-            return False
-
         # Update job status to processing
         job.status = JobStatus.PROCESSING.value
         job.started_at = datetime.utcnow()
@@ -211,9 +209,118 @@ class AvatarJobService:
 
         await db.commit()
 
-        # Trigger RunPod (this is async and will take time)
-        # For now, we do it synchronously. In production, consider using
-        # a background task or message queue for better reliability
+        # Choose execution mode based on configuration
+        mode = self._get_execution_mode()
+
+        if mode == "cli":
+            return await self._trigger_job_cli(job, video_model, db)
+        else:
+            return await self._trigger_job_api(job, video_model, db)
+
+    async def _trigger_job_cli(
+        self, job: AvatarJob, video_model: VideoModel, db: AsyncSession
+    ) -> bool:
+        """
+        Trigger avatar generation via CLI (local subprocess).
+
+        Uses local video file if available, otherwise downloads from S3.
+        Runs genavatar.py, uploads result to S3.
+        """
+        temp_video_path = None
+        use_temp_file = False
+
+        try:
+            # Check if local video file exists
+            if video_model.local_video_path and os.path.exists(video_model.local_video_path):
+                video_path = video_model.local_video_path
+                logger.info(f"Using local video file: {video_path}")
+            else:
+                # Fallback: Download video from S3 to temp file
+                logger.info(f"Local video not found, downloading from S3: {video_model.source_video_key}")
+                ext = os.path.splitext(video_model.source_video_key)[1] or ".mp4"
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                    temp_video_path = tmp.name
+
+                success = await s3_service.download_file(
+                    video_model.source_video_key, temp_video_path
+                )
+
+                if not success:
+                    raise ValueError(f"Failed to download video from S3")
+
+                video_path = temp_video_path
+                use_temp_file = True
+
+            # Run avatar generation via CLI
+            logger.info(f"Starting CLI avatar generation for {job.video_model_id}")
+            result = await livetalking_cli_service.generate_avatar(
+                video_path=video_path,
+                avatar_id=str(job.video_model_id),
+                user_id=job.user_id,
+                img_size=256,  # wav2lip256
+                upload_to_s3=True,
+            )
+
+            if result.success:
+                # Job completed successfully
+                await self.mark_completed(
+                    job.id,
+                    avatar_s3_key=result.s3_key or f"avatars/{job.user_id}/{job.video_model_id}.tar",
+                    db=db,
+                )
+                logger.info(
+                    f"CLI avatar generation completed: {job.video_model_id}, "
+                    f"frames={result.frame_count}, s3_key={result.s3_key}"
+                )
+                return True
+            else:
+                raise ValueError(result.error or "Unknown CLI error")
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"CLI avatar generation failed for {job.id}: {error_msg}")
+
+            # Check if we should retry
+            if job.attempts < job.max_attempts:
+                job.status = JobStatus.PENDING.value
+                job.error_message = f"Attempt {job.attempts} failed: {error_msg}"
+                await db.commit()
+                logger.warning(
+                    f"Job {job.id} failed, will retry. "
+                    f"Attempts: {job.attempts}/{job.max_attempts}"
+                )
+                return False
+            else:
+                await self.mark_failed(
+                    job.id,
+                    f"Max attempts reached. Last error: {error_msg}",
+                    db,
+                )
+                return False
+        finally:
+            # Clean up temp file only if we created one
+            if use_temp_file and temp_video_path and os.path.exists(temp_video_path):
+                os.remove(temp_video_path)
+
+    async def _trigger_job_api(
+        self, job: AvatarJob, video_model: VideoModel, db: AsyncSession
+    ) -> bool:
+        """
+        Trigger avatar generation via RunPod API (remote worker).
+
+        This is the original implementation using HTTP calls to RunPod.
+        """
+        # Generate presigned URL for the video
+        video_url = await s3_service.generate_presigned_url(
+            video_model.source_video_key, expiration=7200  # 2 hours
+        )
+
+        if not video_url:
+            logger.error(f"Could not generate presigned URL for job {job.id}")
+            await self.mark_failed(job.id, "Could not generate download URL", db)
+            return False
+
+        # Trigger RunPod
         s3_bucket = os.getenv("AVATAR_S3_BUCKET", s3_service.bucket_name)
 
         response = await runpod_client.generate_avatar(

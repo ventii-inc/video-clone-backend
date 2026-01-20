@@ -1,6 +1,8 @@
 """Video models router for CRUD operations"""
 
 import asyncio
+import os
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -14,6 +16,7 @@ from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.ai import ai_service
 from app.services.avatar_job import avatar_job_service
+from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.utils import logger
 from app.schemas.common import MessageResponse, PaginationMeta
 from app.schemas.video_model import (
@@ -212,6 +215,30 @@ async def complete_upload(
 
         # Get presigned URL for viewing
         model.source_video_url = await s3_service.generate_presigned_url(model.source_video_key)
+
+        # Save local copy for CLI processing
+        settings = LiveTalkingSettings()
+        if settings.LIVETALKING_MODE == "cli":
+            try:
+                # Ensure local video directory exists
+                Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
+
+                # Get file extension from S3 key
+                ext = os.path.splitext(model.source_video_key)[1] or ".mp4"
+                local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}{ext}")
+
+                # Download from S3 to local
+                logger.info(f"Downloading video to local: {local_path}")
+                success = await s3_service.download_file(model.source_video_key, local_path)
+
+                if success:
+                    model.local_video_path = local_path
+                    logger.info(f"Saved local video copy: {local_path}")
+                else:
+                    logger.warning(f"Failed to save local video copy for model {model.id}")
+            except Exception as e:
+                logger.warning(f"Error saving local video copy: {e}")
+                # Continue without local copy - CLI will download from S3 as fallback
 
     # Update model
     model.duration_seconds = data.duration_seconds

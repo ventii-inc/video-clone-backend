@@ -1,7 +1,10 @@
-"""Mock AI service for video/voice model processing and video generation.
+"""AI service for video/voice model processing and video generation.
 
-This is a placeholder implementation that simulates AI processing.
-Replace with actual AI API integrations in production.
+Supports two modes:
+- CLI mode: Uses local LiveTalking subprocess for avatar/video generation
+- Mock mode: Simulates processing for development/testing
+
+Set LIVETALKING_MODE=cli in environment to use CLI mode.
 """
 
 import asyncio
@@ -19,23 +22,34 @@ from app.models.voice_model import VoiceModel, ModelStatus as VoiceModelStatus
 from app.models.generated_video import GeneratedVideo, GenerationStatus
 from app.services.s3 import s3_service
 from app.services.video import video_service, get_video_duration
+from app.services.livetalking import livetalking_cli_service
+from app.services.livetalking.livetalking_config import LiveTalkingSettings
 
 logger = logging.getLogger(__name__)
 
 
 class AIService:
-    """Mock AI service for development and testing.
+    """AI service for video/voice model processing and video generation.
 
-    In production, this should integrate with:
+    Supports two modes based on LIVETALKING_MODE:
+    - "cli": Uses local LiveTalking subprocess (same server deployment)
+    - "api"/"mock": Uses mock implementation for development/testing
+
+    In full production with remote LiveTalking, integrate with:
     - Video clone model training API
     - Voice clone model training API
     - Lip-sync video generation API
     """
 
-    # Simulated processing times (in seconds)
+    # Simulated processing times (in seconds) for mock mode
     VIDEO_MODEL_PROCESSING_TIME = 5  # Real: 5-30 minutes
     VOICE_MODEL_PROCESSING_TIME = 3  # Real: 2-10 minutes
     VIDEO_GENERATION_TIME = 4  # Real: varies by text length
+
+    def _get_mode(self) -> str:
+        """Get execution mode from settings."""
+        settings = LiveTalkingSettings()
+        return settings.LIVETALKING_MODE
 
     async def process_video_model(
         self,
@@ -205,11 +219,15 @@ class AIService:
         video_id: UUID,
         db: AsyncSession,
     ) -> None:
-        """Generate a video from text using clone models (mock implementation).
+        """Generate a video from text using clone models.
 
-        In production, this would:
+        Supports two modes:
+        - CLI mode: Uses LiveTalking CLI for actual generation
+        - Mock mode: Simulates processing for development
+
+        Steps:
         1. Load video and voice clone models
-        2. Generate speech audio from text
+        2. Generate speech audio from text (TTS)
         3. Generate lip-synced video
         4. Upload to S3
         """
@@ -231,6 +249,93 @@ class AIService:
         video.queue_position = None
         await db.commit()
 
+        mode = self._get_mode()
+
+        if mode == "cli":
+            await self._generate_video_cli(video, db)
+        else:
+            await self._generate_video_mock(video, db)
+
+    async def _generate_video_cli(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Generate video using LiveTalking CLI."""
+        try:
+            # Get the video model to get avatar_id
+            video_model_result = await db.execute(
+                select(VideoModel).where(VideoModel.id == video.video_model_id)
+            )
+            video_model = video_model_result.scalar_one_or_none()
+
+            if not video_model:
+                raise ValueError("Video model not found")
+
+            avatar_id = str(video.video_model_id)
+
+            # Update progress
+            video.progress_percent = 10
+            await db.commit()
+
+            # Generate output path
+            output_filename = f"{video.id}.mp4"
+            output_path = os.path.join(tempfile.gettempdir(), output_filename)
+
+            # Get voice model for TTS reference (if applicable)
+            voice_model_result = await db.execute(
+                select(VoiceModel).where(VoiceModel.id == video.voice_model_id)
+            )
+            voice_model = voice_model_result.scalar_one_or_none()
+            ref_file = voice_model.model_data_url if voice_model else None
+
+            # Update progress
+            video.progress_percent = 20
+            await db.commit()
+
+            # Run CLI video generation
+            logger.info(f"Running CLI video generation for {video.id}")
+            result = await livetalking_cli_service.generate_video(
+                avatar_id=avatar_id,
+                text=video.input_text,
+                output_path=output_path,
+                user_id=video.user_id,
+                ref_file=ref_file,
+                upload_to_s3=True,
+            )
+
+            if not result.success:
+                raise ValueError(result.error or "Video generation failed")
+
+            # Update video record with results
+            video.status = GenerationStatus.COMPLETED.value
+            video.processing_completed_at = datetime.utcnow()
+            video.progress_percent = 100
+            video.duration_seconds = int(result.duration) if result.duration else None
+            video.output_video_key = result.s3_key
+
+            # Get file size
+            if os.path.exists(output_path):
+                video.file_size_bytes = os.path.getsize(output_path)
+                # Clean up local file
+                os.remove(output_path)
+
+            await db.commit()
+            logger.info(f"CLI video generation completed: {video.id}")
+
+        except Exception as e:
+            logger.error(f"CLI video generation failed: {e}")
+            video.status = GenerationStatus.FAILED.value
+            video.error_message = str(e)[:500]
+            video.processing_completed_at = datetime.utcnow()
+            await db.commit()
+
+    async def _generate_video_mock(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Generate video using mock implementation (for development)."""
         # Simulate progress updates
         for progress in [25, 50, 75, 100]:
             await asyncio.sleep(self.VIDEO_GENERATION_TIME / 4)
@@ -249,11 +354,11 @@ class AIService:
         video.duration_seconds = estimated_duration
         video.file_size_bytes = estimated_duration * 500000  # ~500KB per second
         # Set S3 key for generated video
-        video.output_video_key = f"generated-videos/{video.user_id}/{video_id}.mp4"
-        video.thumbnail_url = f"https://picsum.photos/seed/{video_id}/640/360"
+        video.output_video_key = f"generated-videos/{video.user_id}/{video.id}.mp4"
+        video.thumbnail_url = f"https://picsum.photos/seed/{video.id}/640/360"
 
         await db.commit()
-        logger.info(f"Video generation completed: {video_id}")
+        logger.info(f"Mock video generation completed: {video.id}")
 
     async def fail_video_model(
         self,
