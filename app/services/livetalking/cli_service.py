@@ -237,8 +237,23 @@ class LiveTalkingCLIService:
         # Our local avatar path
         local_avatar_dir = self._get_avatar_local_dir(avatar_id)
 
+        # Resolve paths to handle symlinks and normalize
+        livetalking_resolved = os.path.realpath(livetalking_avatar_path)
+        local_resolved = os.path.realpath(local_avatar_dir)
+
         # Move avatar from LiveTalking's location to our avatar storage
-        if os.path.exists(livetalking_avatar_path):
+        # Skip move if paths are the same (AVATAR_LOCAL_PATH == LIVETALKING_ROOT/data/avatars)
+        if livetalking_resolved == local_resolved:
+            # Same path - just check it exists
+            if os.path.exists(local_avatar_dir):
+                logger.info(f"Avatar already at correct location: {local_avatar_dir}")
+            else:
+                return AvatarGenerationResult(
+                    success=False,
+                    avatar_id=avatar_id,
+                    error=f"Avatar directory not found after generation: {local_avatar_dir}",
+                )
+        elif os.path.exists(livetalking_avatar_path):
             if os.path.exists(local_avatar_dir):
                 shutil.rmtree(local_avatar_dir)
             shutil.move(livetalking_avatar_path, local_avatar_dir)
@@ -249,7 +264,7 @@ class LiveTalkingCLIService:
             return AvatarGenerationResult(
                 success=False,
                 avatar_id=avatar_id,
-                error="Avatar directory not found after generation",
+                error=f"Avatar directory not found after generation: {livetalking_avatar_path}",
             )
 
         # Count frames
