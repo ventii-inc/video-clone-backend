@@ -233,10 +233,17 @@ async def run_genavatar(
         stdout_str = stdout.decode().strip()
 
         if stdout_str:
-            try:
-                result = json.loads(stdout_str)
-            except json.JSONDecodeError:
-                result = {"success": False, "error": f"Invalid output: {stdout_str}"}
+            # Find JSON line in output (may have other text like OOM warnings)
+            for line in stdout_str.split("\n"):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        result = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if not result:
+                result = {"success": False, "error": f"No valid JSON in output: {stdout_str[:200]}"}
 
         if process.returncode != 0 and not result:
             result = {"success": False, "error": f"Process exited with code {process.returncode}"}
