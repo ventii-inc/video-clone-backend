@@ -26,6 +26,7 @@ from app.schemas.voice_model import (
     VoiceModelResponse,
     VoiceModelListResponse,
     VoiceModelUpdate,
+    DirectVoiceUploadResponse,
 )
 from app.schemas.generated_video import (
     GenerateVideoRequest,
@@ -80,6 +81,7 @@ __all__ = [
     "VoiceModelResponse",
     "VoiceModelListResponse",
     "VoiceModelUpdate",
+    "DirectVoiceUploadResponse",
     # Generated Video
     "GenerateVideoRequest",
     "GeneratedVideoResponse",

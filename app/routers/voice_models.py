@@ -1,8 +1,11 @@
 """Voice models router for CRUD operations"""
 
+import asyncio
+import os
+import tempfile
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -21,7 +24,9 @@ from app.schemas.voice_model import (
     VoiceModelUpdate,
     VoiceModelCreateResponse,
     VoiceModelUploadCompleteRequest,
+    DirectVoiceUploadResponse,
 )
+from app.utils import logger
 
 router = APIRouter(prefix="/models/voice", tags=["Voice Models"])
 
@@ -170,6 +175,150 @@ async def create_voice_model(
             expires_in_seconds=3600,
         ),
     )
+
+
+@router.post("/upload", response_model=DirectVoiceUploadResponse, status_code=status.HTTP_201_CREATED)
+async def direct_upload_voice(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Audio file to upload"),
+    name: str = Form(..., min_length=1, max_length=100, description="Model name"),
+    duration_seconds: int = Form(..., gt=0, description="Audio duration in seconds"),
+    source_type: str = Form(default="upload", description="Source type: upload or recording"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload audio directly to server and trigger voice cloning.
+
+    Flow:
+    1. Validate and save audio file locally (temp)
+    2. Create model record
+    3. Trigger parallel background tasks:
+       - Upload audio to S3
+       - Process voice (trim + Fish Audio cloning)
+    """
+    # Validate content type
+    if file.content_type not in ALLOWED_AUDIO_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid content type. Allowed: {', '.join(ALLOWED_AUDIO_TYPES)}",
+        )
+
+    # Validate source_type
+    if source_type not in ["upload", "recording"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="source_type must be 'upload' or 'recording'",
+        )
+
+    # Read file to get size and content
+    content = await file.read()
+    file_size = len(content)
+
+    # Validate file size
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB",
+        )
+
+    # Create model record
+    model = VoiceModel(
+        user_id=user.id,
+        name=name,
+        file_size_bytes=file_size,
+        duration_seconds=duration_seconds,
+        source_type=source_type,
+        status=ModelStatus.UPLOADING.value,
+    )
+    db.add(model)
+    await db.commit()
+    await db.refresh(model)
+
+    # Save file to temp directory
+    ext = os.path.splitext(file.filename or "audio.mp3")[1] or ".mp3"
+    temp_dir = tempfile.gettempdir()
+    local_path = os.path.join(temp_dir, f"voice_{model.id}{ext}")
+
+    with open(local_path, "wb") as f:
+        f.write(content)
+
+    logger.info(f"Saved voice audio to temp: {local_path}")
+
+    # Generate S3 key for the audio
+    s3_key = s3_service.generate_s3_key(
+        user_id=str(user.id),
+        filename=file.filename or f"{model.id}.mp3",
+        media_type="voice-models",
+        unique_id=str(model.id),
+    )
+    model.source_audio_key = s3_key
+    await db.commit()
+
+    # Trigger parallel S3 upload and voice processing
+    background_tasks.add_task(
+        process_direct_voice_upload_task,
+        model_id=model.id,
+        local_path=local_path,
+        s3_key=s3_key,
+    )
+
+    return DirectVoiceUploadResponse(
+        model=VoiceModelBrief.model_validate(model),
+        message="Audio uploaded, voice cloning started",
+    )
+
+
+async def process_direct_voice_upload_task(
+    model_id: UUID,
+    local_path: str,
+    s3_key: str,
+):
+    """
+    Background task to run S3 upload and voice processing in parallel.
+    """
+    from app.db import get_db_session
+
+    async def upload_to_s3():
+        """Upload the local audio file to S3."""
+        try:
+            success = await s3_service.upload_file(local_path, s3_key)
+            if success:
+                logger.info(f"Voice S3 upload complete: {s3_key}")
+                # Update model with presigned URL
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VoiceModel).where(VoiceModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.source_audio_url = await s3_service.generate_presigned_url(s3_key)
+                        await db.commit()
+            else:
+                logger.error(f"Voice S3 upload failed: {s3_key}")
+        except Exception as e:
+            logger.error(f"Voice S3 upload error: {e}")
+
+    async def process_voice():
+        """Process voice model (trim + Fish Audio cloning)."""
+        async with get_db_session() as db:
+            await ai_service.process_voice_model(model_id, db)
+
+    # Run S3 upload and voice processing in parallel
+    try:
+        await asyncio.gather(
+            upload_to_s3(),
+            process_voice(),
+            return_exceptions=True,
+        )
+    finally:
+        # Clean up temp file
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+                logger.info(f"Cleaned up temp file: {local_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up temp file {local_path}: {e}")
 
 
 @router.post("/{model_id}/upload-complete", response_model=dict)

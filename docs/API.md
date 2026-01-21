@@ -81,19 +81,26 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 |--------|------|-------------|
 | GET | `/models/voice` | List voice models (paginated) |
 | GET | `/models/voice/{id}` | Get voice model by ID |
-| POST | `/models/voice` | Create voice model, get upload URL |
-| POST | `/models/voice/{id}/upload-complete` | Mark upload done, start processing |
+| POST | `/models/voice` | Create voice model, get presigned upload URL |
+| POST | `/models/voice/upload` | **Direct upload** - upload file directly to server |
+| POST | `/models/voice/{id}/upload-complete` | Mark presigned upload done, start processing |
 | PATCH | `/models/voice/{id}` | Update model name |
 | DELETE | `/models/voice/{id}` | Delete voice model |
 
 **Query Params (GET list):** `status`, `source_type`, `page`, `limit`
 
-**Create Request:**
+**Create Request (presigned URL flow):**
 - `name` - Display name (1-100 chars)
 - `file_name` - Original filename
 - `file_size_bytes` - File size (max 100MB)
 - `content_type` - "audio/mpeg", "audio/wav", "audio/mp4", "audio/webm", etc.
 - `source_type` - "upload" or "recording"
+
+**Direct Upload (multipart form):**
+- `file` - Audio file (max 100MB)
+- `name` - Display name (1-100 chars)
+- `duration_seconds` - Audio duration in seconds
+- `source_type` - "upload" or "recording" (default: "upload")
 
 ---
 

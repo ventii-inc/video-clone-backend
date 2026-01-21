@@ -73,3 +73,9 @@ class VoiceModelListResponse(BaseModel):
     """Paginated list of voice models"""
     models: list[VoiceModelBrief]
     pagination: PaginationMeta
+
+
+class DirectVoiceUploadResponse(BaseModel):
+    """Response when uploading voice directly to server"""
+    model: VoiceModelBrief
+    message: str
