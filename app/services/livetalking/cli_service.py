@@ -99,12 +99,15 @@ class LiveTalkingCLIService:
         """
         work_dir = cwd or self.livetalking_root
 
-        # Build shell command with venv activation
-        activate_cmd = self._get_activate_command()
-        cmd_str = " ".join(command)
-        full_command = f"{activate_cmd} && {cmd_str}"
+        # Build command using venv Python directly (avoids shell compatibility issues)
+        # Replace "python" with the venv's Python path
+        venv_python = self._get_venv_python()
+        modified_command = command.copy()
+        if modified_command[0] == "python":
+            modified_command[0] = venv_python
+        full_command = " ".join(modified_command)
 
-        logger.info(f"Running CLI command: {cmd_str}")
+        logger.info(f"Running CLI command: {full_command}")
         logger.debug(f"Working directory: {work_dir}")
 
         try:
