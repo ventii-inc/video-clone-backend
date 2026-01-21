@@ -10,12 +10,13 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db_session
-from app.models import AvatarJob, VideoModel
+from app.models import AvatarJob, User, VideoModel
 from app.models.avatar_job import JobStatus
 from app.models.video_model import ModelStatus
 from app.services.avatar_job.runpod_client import runpod_client
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
+from app.services.email import EmailProvider, TrainingCompletionData, get_email_service
 from app.services.s3 import s3_service
 from app.utils import logger
 
@@ -166,10 +167,37 @@ class AvatarJobService:
 
         return jobs_started
 
-    def _get_execution_mode(self) -> str:
-        """Get the execution mode (cli or api) from settings."""
+    async def _get_execution_mode(self) -> str:
+        """
+        Determine execution mode based on GPU availability.
+
+        Logic:
+        1. If LIVETALKING_MODE is explicitly "cli" → return "cli"
+        2. If LIVETALKING_MODE is "auto" or "api" → check RunPod GPU availability
+        3. If GPU available → return "api"
+        4. Otherwise → return "cli" (fallback)
+
+        Returns:
+            "cli" or "api"
+        """
         settings = LiveTalkingSettings()
-        return settings.LIVETALKING_MODE
+
+        # If explicitly set to CLI, use CLI
+        if settings.LIVETALKING_MODE == "cli":
+            return "cli"
+
+        # If set to "auto" or "api", check GPU availability
+        if settings.LIVETALKING_MODE in ("auto", "api"):
+            gpu_available = await runpod_client.check_gpu_availability("NVIDIA RTX 5090")
+            if gpu_available:
+                logger.info("RTX 5090 available, using API mode")
+                return "api"
+            else:
+                logger.info("RTX 5090 not available, falling back to CLI mode")
+                return "cli"
+
+        # Default fallback
+        return "cli"
 
     async def trigger_job(self, job: AvatarJob, db: AsyncSession) -> bool:
         """
@@ -209,8 +237,8 @@ class AvatarJobService:
 
         await db.commit()
 
-        # Choose execution mode based on configuration
-        mode = self._get_execution_mode()
+        # Choose execution mode based on GPU availability
+        mode = await self._get_execution_mode()
 
         if mode == "cli":
             return await self._trigger_job_cli(job, video_model, db)
@@ -396,7 +424,28 @@ class AvatarJobService:
             video_model.processing_completed_at = datetime.utcnow()
             video_model.error_message = None
 
+        # Fetch user for email notification
+        user_result = await db.execute(select(User).where(User.id == job.user_id))
+        user = user_result.scalar_one_or_none()
+
         await db.commit()
+
+        # Send training completion email
+        if user and user.email:
+            try:
+                email_service = get_email_service(EmailProvider.GOOGLE_WORKSPACE)
+                await email_service.send_training_completion_email(
+                    to_email=user.email,
+                    data=TrainingCompletionData(
+                        user_name=user.name or "there",
+                        model_name=video_model.name if video_model else "Your Avatar",
+                        model_type="video",
+                        dashboard_url=None,
+                    ),
+                )
+                logger.info(f"Sent completion email to {user.email} for job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to send completion email for job {job_id}: {e}")
 
         logger.info(
             f"Job {job_id} completed successfully. Avatar key: {avatar_s3_key}"

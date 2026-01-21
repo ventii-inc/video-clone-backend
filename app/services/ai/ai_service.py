@@ -22,6 +22,7 @@ from app.models.voice_model import VoiceModel, ModelStatus as VoiceModelStatus
 from app.models.generated_video import GeneratedVideo, GenerationStatus
 from app.services.s3 import s3_service
 from app.services.video import video_service, get_video_duration
+from app.services.audio import audio_service, get_audio_duration
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.fish_audio import fish_audio_service
@@ -184,8 +185,9 @@ class AIService:
 
         Steps:
         1. Download source audio from S3
-        2. Send to Fish Audio API for voice cloning
-        3. Store the Fish Audio model ID for TTS generation
+        2. Trim to 60 seconds if longer
+        3. Send to Fish Audio API for voice cloning
+        4. Store the Fish Audio model ID for TTS generation
         """
         logger.info(f"Starting voice model processing: {model_id}")
 
@@ -211,7 +213,10 @@ class AIService:
             return
 
         try:
-            # Get presigned URL for the source audio
+            # Process training audio: download, trim if needed, re-upload
+            await self._process_training_audio(model, db)
+
+            # Get presigned URL for the (possibly trimmed) source audio
             if not model.source_audio_key:
                 raise ValueError("No source audio key found")
 
@@ -246,6 +251,75 @@ class AIService:
             model.error_message = str(e)[:500]
             model.processing_completed_at = datetime.utcnow()
             await db.commit()
+
+    async def _process_training_audio(
+        self,
+        model: VoiceModel,
+        db: AsyncSession,
+    ) -> None:
+        """
+        Download, trim (if needed), and re-upload training audio.
+
+        Training audio is trimmed to a maximum of 60 seconds.
+        """
+        if not model.source_audio_key:
+            logger.warning(f"No source audio key for model {model.id}")
+            return
+
+        # Create temp directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Determine file extension from s3 key
+            ext = os.path.splitext(model.source_audio_key)[1] or ".wav"
+            input_path = os.path.join(temp_dir, f"input{ext}")
+            output_path = os.path.join(temp_dir, f"output{ext}")
+
+            # Download audio from S3
+            logger.info(f"Downloading audio from S3: {model.source_audio_key}")
+            success = await s3_service.download_file(model.source_audio_key, input_path)
+
+            if not success:
+                raise ValueError(f"Failed to download audio from S3: {model.source_audio_key}")
+
+            # Process (trim if needed)
+            try:
+                final_path, duration, was_trimmed = await audio_service.process_training_audio(
+                    input_path, output_path
+                )
+
+                # Update duration on model
+                model.duration_seconds = int(duration)
+
+                if was_trimmed:
+                    logger.info(f"Audio was trimmed to {duration}s, re-uploading to S3")
+
+                    # Get file size of trimmed audio
+                    model.file_size_bytes = os.path.getsize(final_path)
+
+                    # Re-upload trimmed audio to same S3 key
+                    content_type = s3_service._get_content_type(final_path)
+                    await s3_service.upload_file(
+                        final_path,
+                        model.source_audio_key,
+                        content_type=content_type,
+                    )
+                    logger.info(f"Trimmed audio uploaded to S3: {model.source_audio_key}")
+                else:
+                    logger.info(f"Audio duration is {duration}s, no trimming needed")
+                    # Update file size from original
+                    model.file_size_bytes = os.path.getsize(input_path)
+
+                await db.commit()
+
+            except ValueError as e:
+                # If trimming fails but we can still get duration, continue
+                duration = await get_audio_duration(input_path)
+                if duration:
+                    model.duration_seconds = int(duration)
+                    model.file_size_bytes = os.path.getsize(input_path)
+                    await db.commit()
+                    logger.warning(f"Trim failed but continuing with original audio: {e}")
+                else:
+                    raise
 
     async def _process_voice_model_mock(
         self,

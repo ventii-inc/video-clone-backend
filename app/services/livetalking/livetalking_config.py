@@ -106,10 +106,11 @@ class LiveTalkingSettings(BaseSettings):
     # Execution Mode
     # ===================
 
-    # Whether to use CLI (local) or API (remote) for avatar/video generation
-    # "cli" = subprocess execution (same server)
-    # "api" = HTTP/RunPod API calls (remote server)
-    LIVETALKING_MODE: str = os.getenv("LIVETALKING_MODE", "cli")
+    # Execution mode for avatar/video generation:
+    # "cli"  = Always use subprocess execution (same server)
+    # "api"  = Always use HTTP/RunPod API calls (remote server)
+    # "auto" = Check GPU availability, use API if RTX 5090 available, else CLI
+    LIVETALKING_MODE: str = os.getenv("LIVETALKING_MODE", "auto")
 
     class Config:
         env_prefix = ""
