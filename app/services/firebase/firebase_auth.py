@@ -1,7 +1,6 @@
 """Firebase authentication middleware and utilities"""
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -15,9 +14,6 @@ from app.models.user import User
 from app.services.firebase.firebase_config import get_firebase_app
 
 logger = logging.getLogger(__name__)
-
-# Dev-only: Allow bypassing Firebase auth with X-Dev-User-Email header
-DEV_AUTH_ENABLED = os.getenv("DEBUG", "").lower() == "true"
 
 
 @dataclass
@@ -106,9 +102,6 @@ async def get_current_user(
     3. Looks up or creates the user in the database
     4. Returns the User object
 
-    Dev mode (DEBUG=true):
-    - Use X-Dev-User-Email header to bypass Firebase auth
-
     Args:
         request: The FastAPI request object
         db: SQLAlchemy async database session
@@ -119,19 +112,6 @@ async def get_current_user(
     Raises:
         HTTPException: If authentication fails or user not found
     """
-    # Dev-only: Allow bypassing Firebase auth
-    if DEV_AUTH_ENABLED:
-        dev_email = request.headers.get("X-Dev-User-Email")
-        if dev_email:
-            logger.warning(f"DEV AUTH: Bypassing Firebase for {dev_email}")
-            result = await db.execute(select(User).where(User.email == dev_email))
-            user = result.scalar_one_or_none()
-            if not user:
-                raise HTTPException(
-                    status_code=404, detail=f"Dev user not found: {dev_email}"
-                )
-            return user
-
     token = get_token_from_header(request)
     token_data = verify_token(token)
 
@@ -169,9 +149,6 @@ async def get_current_user_or_create(
 
     Similar to get_current_user but creates the user if they don't exist.
 
-    Dev mode (DEBUG=true):
-    - Use X-Dev-User-Email header to bypass Firebase auth (creates user if needed)
-
     Args:
         request: The FastAPI request object
         db: SQLAlchemy async database session
@@ -182,25 +159,6 @@ async def get_current_user_or_create(
     Raises:
         HTTPException: If authentication fails
     """
-    # Dev-only: Allow bypassing Firebase auth
-    if DEV_AUTH_ENABLED:
-        dev_email = request.headers.get("X-Dev-User-Email")
-        if dev_email:
-            logger.warning(f"DEV AUTH: Bypassing Firebase for {dev_email}")
-            result = await db.execute(select(User).where(User.email == dev_email))
-            user = result.scalar_one_or_none()
-            if not user:
-                user = User(
-                    firebase_uid=f"dev_{dev_email}",
-                    email=dev_email,
-                    name=dev_email.split("@")[0],
-                )
-                db.add(user)
-                await db.commit()
-                await db.refresh(user)
-                logger.info(f"DEV AUTH: Created user {dev_email}")
-            return user
-
     token = get_token_from_header(request)
     token_data = verify_token(token)
 
