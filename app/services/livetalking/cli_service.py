@@ -99,6 +99,15 @@ class LiveTalkingCLIService:
         """
         work_dir = cwd or self.livetalking_root
 
+        # Set up environment with PYTHONPATH for LiveTalking modules
+        # face_detection and other modules are in wav2lip/ directory
+        env = os.environ.copy()
+        wav2lip_path = os.path.join(self.livetalking_root, "wav2lip")
+        pythonpath = f"{self.livetalking_root}:{wav2lip_path}"
+        if "PYTHONPATH" in env:
+            pythonpath = f"{pythonpath}:{env['PYTHONPATH']}"
+        env["PYTHONPATH"] = pythonpath
+
         # Build command using venv Python directly (avoids shell compatibility issues)
         # Replace "python" with the venv's Python path
         venv_python = self._get_venv_python()
@@ -108,7 +117,8 @@ class LiveTalkingCLIService:
         full_command = " ".join(modified_command)
 
         logger.info(f"Running CLI command: {full_command}")
-        logger.debug(f"Working directory: {work_dir}")
+        logger.info(f"Working directory: {work_dir}")
+        logger.info(f"PYTHONPATH: {pythonpath}")
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -116,6 +126,7 @@ class LiveTalkingCLIService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=work_dir,
+                env=env,
             )
 
             stdout, stderr = await asyncio.wait_for(
@@ -126,11 +137,13 @@ class LiveTalkingCLIService:
             stdout_str = stdout.decode("utf-8") if stdout else ""
             stderr_str = stderr.decode("utf-8") if stderr else ""
 
-            logger.debug(f"Command exit code: {process.returncode}")
+            logger.info(f"Command exit code: {process.returncode}")
             if stdout_str:
-                logger.debug(f"stdout: {stdout_str[:500]}")
-            if stderr_str and process.returncode != 0:
-                logger.warning(f"stderr: {stderr_str[:500]}")
+                logger.info(f"stdout (first 1000 chars): {stdout_str[:1000]}")
+            if stderr_str:
+                # Always log stderr for debugging
+                log_level = logger.warning if process.returncode != 0 else logger.info
+                log_level(f"stderr (first 1000 chars): {stderr_str[:1000]}")
 
             return process.returncode, stdout_str, stderr_str
 
