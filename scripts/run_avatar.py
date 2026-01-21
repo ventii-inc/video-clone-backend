@@ -381,11 +381,18 @@ async def main():
     # Upload to S3 if successful and not skipped
     if result.get("success") and not args.no_upload:
         try:
+            from app.services.livetalking.livetalking_config import LiveTalkingSettings
+            settings = LiveTalkingSettings()
+
             avatar_path = result.get("avatar_path")
+            # Resolve relative path against LiveTalking root (where script runs)
+            if avatar_path and not os.path.isabs(avatar_path):
+                avatar_path = os.path.join(settings.LIVETALKING_ROOT, avatar_path)
+
             if avatar_path and os.path.exists(avatar_path):
                 s3_key = await upload_to_s3(args.avatar_id, args.user_id, avatar_path)
             else:
-                print(f"\nWarning: Avatar path not found, skipping S3 upload")
+                print(f"\nWarning: Avatar path not found: {avatar_path}, skipping S3 upload")
         except Exception as e:
             print(f"\nWarning: S3 upload failed: {e}")
 
