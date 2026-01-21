@@ -124,7 +124,7 @@ async def upload_avatar(
     presigned_url = await s3_service.generate_presigned_upload_url(
         s3_key=s3_key,
         content_type=data.content_type,
-        expires_in=3600,
+        expiration=3600,
     )
 
     return {
