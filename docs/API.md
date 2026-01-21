@@ -57,8 +57,9 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 |--------|------|-------------|
 | GET | `/models/video` | List video models (paginated) |
 | GET | `/models/video/{id}` | Get video model by ID |
-| POST | `/models/video` | Create video model, get upload URL |
-| POST | `/models/video/{id}/upload-complete` | Mark upload done, start processing |
+| POST | `/models/video` | Create video model, get presigned upload URL |
+| POST | `/models/video/upload` | **Direct upload** - upload file directly to server |
+| POST | `/models/video/{id}/upload-complete` | Mark presigned upload done, start processing |
 | PATCH | `/models/video/{id}` | Update model name |
 | DELETE | `/models/video/{id}` | Delete video model |
 

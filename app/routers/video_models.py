@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -28,6 +28,7 @@ from app.schemas.video_model import (
     VideoModelCreateResponse,
     UploadCompleteRequest,
     AvatarReadyRequest,
+    DirectUploadResponse,
 )
 from app.schemas.common import UploadInfo
 
@@ -170,6 +171,146 @@ async def create_video_model(
             s3_key=s3_key,
             expires_in_seconds=3600,
         ),
+    )
+
+
+@router.post("/upload", response_model=DirectUploadResponse, status_code=status.HTTP_201_CREATED)
+async def direct_upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Video file to upload"),
+    name: str = Form(..., min_length=1, max_length=100, description="Model name"),
+    duration_seconds: int = Form(..., gt=0, description="Video duration in seconds"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload video directly to server and trigger avatar generation.
+
+    Flow:
+    1. Validate and save video file locally
+    2. Create model record
+    3. Trigger parallel background tasks:
+       - Upload video to S3
+       - Generate avatar (which uploads to S3 when complete)
+    """
+    # Validate content type
+    if file.content_type not in ALLOWED_VIDEO_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid content type. Allowed: {', '.join(ALLOWED_VIDEO_TYPES)}",
+        )
+
+    # Read file to get size and content
+    content = await file.read()
+    file_size = len(content)
+
+    # Validate file size
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB",
+        )
+
+    # Create model record
+    model = VideoModel(
+        user_id=user.id,
+        name=name,
+        file_size_bytes=file_size,
+        duration_seconds=duration_seconds,
+        status=ModelStatus.UPLOADING.value,
+    )
+    db.add(model)
+    await db.commit()
+    await db.refresh(model)
+
+    # Save file locally
+    settings = LiveTalkingSettings()
+    Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
+
+    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}{ext}")
+
+    with open(local_path, "wb") as f:
+        f.write(content)
+
+    model.local_video_path = local_path
+    logger.info(f"Saved video locally: {local_path}")
+
+    # Generate S3 key for the video
+    s3_key = s3_service.generate_s3_key(
+        user_id=str(user.id),
+        filename=file.filename or f"{model.id}.mp4",
+        media_type="training-videos",
+        unique_id=str(model.id),
+    )
+    model.source_video_key = s3_key
+    await db.commit()
+
+    # Create avatar generation job
+    job = await avatar_job_service.create_job(
+        video_model_id=model.id,
+        user_id=user.id,
+        db=db,
+    )
+    logger.info(f"Created avatar job {job.id} for video model {model.id}")
+
+    # Trigger parallel S3 upload and avatar generation
+    background_tasks.add_task(
+        process_direct_upload_task,
+        model_id=model.id,
+        user_id=user.id,
+        local_path=local_path,
+        s3_key=s3_key,
+    )
+
+    return DirectUploadResponse(
+        model=VideoModelBrief.model_validate(model),
+        job_id=job.id,
+        message="Video uploaded, processing started",
+    )
+
+
+async def process_direct_upload_task(
+    model_id: UUID,
+    user_id: UUID,
+    local_path: str,
+    s3_key: str,
+):
+    """
+    Background task to run S3 upload and avatar generation in parallel.
+    """
+    from app.db import get_db_session
+
+    async def upload_to_s3():
+        """Upload the local video file to S3."""
+        try:
+            success = await s3_service.upload_file(local_path, s3_key)
+            if success:
+                logger.info(f"S3 upload complete: {s3_key}")
+                # Update model with presigned URL
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VideoModel).where(VideoModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.source_video_url = await s3_service.generate_presigned_url(s3_key)
+                        await db.commit()
+            else:
+                logger.error(f"S3 upload failed: {s3_key}")
+        except Exception as e:
+            logger.error(f"S3 upload error: {e}")
+
+    async def generate_avatar():
+        """Process avatar generation."""
+        async with get_db_session() as db:
+            await avatar_job_service.process_pending_jobs(db)
+
+    # Run S3 upload and avatar generation in parallel
+    await asyncio.gather(
+        upload_to_s3(),
+        generate_avatar(),
+        return_exceptions=True,
     )
 
 

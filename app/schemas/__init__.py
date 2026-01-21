@@ -19,6 +19,7 @@ from app.schemas.video_model import (
     VideoModelUpdate,
     UploadCompleteRequest,
     UploadInfo,
+    DirectUploadResponse,
 )
 from app.schemas.voice_model import (
     VoiceModelCreate,
@@ -73,6 +74,7 @@ __all__ = [
     "VideoModelUpdate",
     "UploadCompleteRequest",
     "UploadInfo",
+    "DirectUploadResponse",
     # Voice Model
     "VoiceModelCreate",
     "VoiceModelResponse",

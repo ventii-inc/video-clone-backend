@@ -76,3 +76,10 @@ class VideoModelListResponse(BaseModel):
     """Paginated list of video models"""
     models: list[VideoModelBrief]
     pagination: PaginationMeta
+
+
+class DirectUploadResponse(BaseModel):
+    """Response when uploading video directly to server"""
+    model: VideoModelBrief
+    job_id: UUID
+    message: str
