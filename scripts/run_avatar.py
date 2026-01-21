@@ -352,6 +352,11 @@ async def main():
         help="Skip S3 upload (local testing)"
     )
     parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing avatar (default: skip if exists)"
+    )
+    parser.add_argument(
         "--use-livetalking",
         action="store_true",
         help="Use LiveTalking's genavatar.py instead of forked version"
@@ -363,6 +368,27 @@ async def main():
     if not os.path.exists(args.video):
         print(f"Error: Video file not found: {args.video}")
         sys.exit(1)
+
+    # Check if avatar already exists (unless --force)
+    if not args.force:
+        from app.services.livetalking.livetalking_config import LiveTalkingSettings
+        settings = LiveTalkingSettings()
+
+        # Check local path
+        local_avatar_path = os.path.join(settings.LIVETALKING_ROOT, "data", "avatars", args.avatar_id)
+        if os.path.exists(local_avatar_path):
+            print(f"Avatar already exists locally: {local_avatar_path}")
+            print("Use --force to overwrite")
+            sys.exit(0)
+
+        # Check S3 if upload enabled
+        if not args.no_upload:
+            from app.services.s3 import s3_service
+            s3_key = f"avatars/{args.user_id}/{args.avatar_id}.tar"
+            if await s3_service.file_exists(s3_key):
+                print(f"Avatar already exists in S3: {s3_key}")
+                print("Use --force to overwrite")
+                sys.exit(0)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
