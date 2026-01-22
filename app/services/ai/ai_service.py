@@ -21,6 +21,7 @@ from app.models.video_model import VideoModel, ModelStatus as VideoModelStatus
 from app.models.voice_model import VoiceModel, ModelStatus as VoiceModelStatus
 from app.models.generated_video import GeneratedVideo, GenerationStatus
 from app.services.s3 import s3_service
+from app.services.usage_service import usage_service
 from app.services.video import video_service, get_video_duration
 from app.services.audio import audio_service, get_audio_duration
 from app.services.livetalking import livetalking_cli_service
@@ -47,6 +48,39 @@ class AIService:
     VIDEO_MODEL_PROCESSING_TIME = 5  # Real: 5-30 minutes
     VOICE_MODEL_PROCESSING_TIME = 3  # Real: 2-10 minutes
     VIDEO_GENERATION_TIME = 4  # Real: varies by text length
+
+    def _calculate_minutes_from_duration(self, duration_seconds: int | None) -> int:
+        """Calculate billable minutes from video duration in seconds.
+
+        Rounds up to nearest minute, minimum 1 minute.
+        """
+        if not duration_seconds or duration_seconds <= 0:
+            return 1  # Minimum 1 minute charge
+        # Round up to nearest minute
+        return max(1, (duration_seconds + 59) // 60)
+
+    async def _deduct_credits_for_video(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Deduct credits based on actual video duration after generation completes."""
+        minutes_used = self._calculate_minutes_from_duration(video.duration_seconds)
+
+        try:
+            await usage_service.deduct_credits(video.user_id, minutes_used, db)
+            video.credits_used = minutes_used
+            await db.commit()
+            logger.info(
+                f"Deducted {minutes_used} minutes for video {video.id} "
+                f"(duration: {video.duration_seconds}s)"
+            )
+        except ValueError as e:
+            # Insufficient credits - log but don't fail the video
+            # Video was already generated, so we still charge what we can
+            logger.warning(f"Credit deduction issue for video {video.id}: {e}")
+            video.credits_used = minutes_used
+            await db.commit()
 
     def _get_mode(self) -> str:
         """Get execution mode from settings."""
@@ -443,6 +477,10 @@ class AIService:
                 os.remove(output_path)
 
             await db.commit()
+
+            # Deduct credits based on actual video duration
+            await self._deduct_credits_for_video(video, db)
+
             logger.info(f"CLI video generation completed: {video.id}")
 
         except Exception as e:
@@ -480,6 +518,10 @@ class AIService:
         video.thumbnail_url = f"https://picsum.photos/seed/{video.id}/640/360"
 
         await db.commit()
+
+        # Deduct credits based on actual video duration
+        await self._deduct_credits_for_video(video, db)
+
         logger.info(f"Mock video generation completed: {video.id}")
 
     async def fail_video_model(
