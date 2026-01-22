@@ -5,13 +5,22 @@ Usage:
     ENV=staging uv run python scripts/backfill_thumbnails.py
 """
 
-import asyncio
 import os
 import sys
-import tempfile
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Load environment-specific .env file BEFORE any app imports
+from dotenv import load_dotenv
+
+env = os.getenv("ENV", "local")
+dotenv_file = f".env.{env}"
+load_dotenv(dotenv_file)
+print(f"Loaded environment from {dotenv_file}")
+
+import asyncio
+import tempfile
 
 from app.db import get_db_session
 from app.models import VideoModel
