@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from app.services.avatar_job import avatar_job_service
 from app.services.video import extract_thumbnail
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.utils import logger
+from app.utils.constants import MAX_VIDEO_MODELS_PER_USER
 from app.schemas.common import MessageResponse, PaginationMeta
 from app.schemas.video_model import (
     VideoModelCreate,
@@ -51,6 +53,9 @@ async def list_video_models(
     """
     List user's video models with optional status filter.
     """
+    total_start = time.perf_counter()
+    timings = {}
+
     # Build query
     query = select(VideoModel).where(VideoModel.user_id == user.id)
 
@@ -58,25 +63,46 @@ async def list_video_models(
         query = query.where(VideoModel.status == status)
 
     # Get total count
+    t0 = time.perf_counter()
     count_query = select(func.count()).select_from(query.subquery())
     total_result = await db.execute(count_query)
     total = total_result.scalar()
+    timings["count_query"] = (time.perf_counter() - t0) * 1000
 
     # Apply pagination
     query = query.order_by(VideoModel.created_at.desc())
     query = query.offset((page - 1) * limit).limit(limit)
 
+    t0 = time.perf_counter()
     result = await db.execute(query)
     models = result.scalars().all()
+    timings["main_query"] = (time.perf_counter() - t0) * 1000
 
     # Generate presigned URLs for thumbnails
+    t0 = time.perf_counter()
     model_briefs = []
+    thumbnail_timings = []
     for m in models:
         brief = VideoModelBrief.model_validate(m)
         # Generate thumbnail URL from thumbnail_key if available
         if m.thumbnail_key:
+            t_thumb = time.perf_counter()
             brief.thumbnail_url = await s3_service.generate_presigned_url(m.thumbnail_key)
+            thumbnail_timings.append((time.perf_counter() - t_thumb) * 1000)
         model_briefs.append(brief)
+    timings["presigned_urls_total"] = (time.perf_counter() - t0) * 1000
+    timings["presigned_urls_individual"] = thumbnail_timings
+
+    timings["total"] = (time.perf_counter() - total_start) * 1000
+
+    logger.info(
+        f"[PERF] list_video_models: "
+        f"count_query={timings['count_query']:.1f}ms, "
+        f"main_query={timings['main_query']:.1f}ms, "
+        f"presigned_urls_total={timings['presigned_urls_total']:.1f}ms "
+        f"(count={len(thumbnail_timings)}, each={thumbnail_timings if thumbnail_timings else 'N/A'}), "
+        f"TOTAL={timings['total']:.1f}ms"
+    )
 
     return VideoModelListResponse(
         models=model_briefs,
@@ -136,6 +162,17 @@ async def create_video_model(
     4. Client uploads directly to S3
     5. Client calls /upload-complete when done
     """
+    # Check model creation limit
+    count_result = await db.execute(
+        select(func.count()).where(VideoModel.user_id == user.id)
+    )
+    current_count = count_result.scalar()
+    if current_count >= MAX_VIDEO_MODELS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+        )
+
     # Validate content type
     if data.content_type not in ALLOWED_VIDEO_TYPES:
         raise HTTPException(
@@ -208,6 +245,17 @@ async def direct_upload_video(
        - Upload video to S3
        - Generate avatar (which uploads to S3 when complete)
     """
+    # Check model creation limit
+    count_result = await db.execute(
+        select(func.count()).where(VideoModel.user_id == user.id)
+    )
+    current_count = count_result.scalar()
+    if current_count >= MAX_VIDEO_MODELS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+        )
+
     # Validate content type
     if file.content_type not in ALLOWED_VIDEO_TYPES:
         raise HTTPException(

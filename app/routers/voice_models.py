@@ -15,6 +15,7 @@ from app.models.voice_model import ModelStatus, SourceType
 from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.ai import ai_service
+from app.services.fish_audio import fish_audio_service
 from app.schemas.common import MessageResponse, PaginationMeta, UploadInfo
 from app.schemas.voice_model import (
     VoiceModelCreate,
@@ -27,6 +28,7 @@ from app.schemas.voice_model import (
     DirectVoiceUploadResponse,
 )
 from app.utils import logger
+from app.utils.constants import MAX_VOICE_MODELS_PER_USER
 
 router = APIRouter(prefix="/models/voice", tags=["Voice Models"])
 
@@ -123,6 +125,17 @@ async def create_voice_model(
     """
     Create a new voice model and get presigned upload URL.
     """
+    # Check model creation limit
+    count_result = await db.execute(
+        select(func.count()).where(VoiceModel.user_id == user.id)
+    )
+    current_count = count_result.scalar()
+    if current_count >= MAX_VOICE_MODELS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+        )
+
     # Validate content type
     if data.content_type not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(
@@ -197,6 +210,17 @@ async def direct_upload_voice(
        - Upload audio to S3
        - Process voice (trim + Fish Audio cloning)
     """
+    # Check model creation limit
+    count_result = await db.execute(
+        select(func.count()).where(VoiceModel.user_id == user.id)
+    )
+    current_count = count_result.scalar()
+    if current_count >= MAX_VOICE_MODELS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+        )
+
     # Validate content type
     if file.content_type not in ALLOWED_AUDIO_TYPES:
         raise HTTPException(
@@ -397,7 +421,7 @@ async def update_voice_model(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Update voice model name.
+    Update voice model name and/or visibility.
     """
     result = await db.execute(
         select(VoiceModel).where(
@@ -413,7 +437,35 @@ async def update_voice_model(
             detail="Voice model not found",
         )
 
-    model.name = data.name
+    # Check if at least one field is provided
+    if data.name is None and data.visibility is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field (name or visibility) must be provided",
+        )
+
+    # Update Fish Audio model if visibility is being changed and model is completed
+    if data.visibility is not None and model.model_data_url and model.status == "completed":
+        fish_audio_id = model.model_data_url
+        # Skip if it's a mock model
+        if not fish_audio_id.startswith("mock://"):
+            update_result = await fish_audio_service.update_model(
+                model_id=fish_audio_id,
+                title=data.name if data.name else None,
+                visibility=data.visibility,
+            )
+            if not update_result.get("success"):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to update Fish Audio model: {update_result.get('error')}",
+                )
+
+    # Update local database
+    if data.name is not None:
+        model.name = data.name
+    if data.visibility is not None:
+        model.visibility = data.visibility
+
     await db.commit()
     await db.refresh(model)
 
