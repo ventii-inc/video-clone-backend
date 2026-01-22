@@ -110,7 +110,7 @@ class LiveTalkingSettings(BaseSettings):
     # "cli"  = Always use subprocess execution (same server)
     # "api"  = Always use HTTP/RunPod API calls (remote server)
     # "auto" = Check GPU availability, use API if RTX 5090 available, else CLI
-    LIVETALKING_MODE: str = os.getenv("LIVETALKING_MODE", "auto")
+    LIVETALKING_MODE: str = os.getenv("LIVETALKING_MODE", "cli")
 
     class Config:
         env_prefix = ""
