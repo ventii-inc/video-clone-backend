@@ -216,7 +216,7 @@ async def get_download_url(
     # Generate fresh presigned URL
     download_url = await s3_service.generate_presigned_url(
         video.output_video_key,
-        expires_in=3600,
+        expiration=3600,
     )
 
     # Generate filename
