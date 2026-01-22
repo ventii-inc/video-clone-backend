@@ -16,6 +16,7 @@ from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.ai import ai_service
 from app.services.avatar_job import avatar_job_service
+from app.services.video import extract_thumbnail
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.utils import logger
 from app.schemas.common import MessageResponse, PaginationMeta
@@ -68,8 +69,17 @@ async def list_video_models(
     result = await db.execute(query)
     models = result.scalars().all()
 
+    # Generate presigned URLs for thumbnails
+    model_briefs = []
+    for m in models:
+        brief = VideoModelBrief.model_validate(m)
+        # Generate thumbnail URL from thumbnail_key if available
+        if m.thumbnail_key:
+            brief.thumbnail_url = await s3_service.generate_presigned_url(m.thumbnail_key)
+        model_briefs.append(brief)
+
     return VideoModelListResponse(
-        models=[VideoModelBrief.model_validate(m) for m in models],
+        models=model_briefs,
         pagination=PaginationMeta(
             page=page,
             limit=limit,
@@ -102,7 +112,12 @@ async def get_video_model(
             detail="Video model not found",
         )
 
-    return VideoModelResponse.model_validate(model)
+    response = VideoModelResponse.model_validate(model)
+    # Generate thumbnail URL from thumbnail_key if available
+    if model.thumbnail_key:
+        response.thumbnail_url = await s3_service.generate_presigned_url(model.thumbnail_key)
+
+    return response
 
 
 @router.post("", response_model=VideoModelCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -277,7 +292,7 @@ async def process_direct_upload_task(
     s3_key: str,
 ):
     """
-    Background task to run S3 upload and avatar generation in parallel.
+    Background task to run S3 upload, thumbnail generation, and avatar generation in parallel.
     """
     from app.db import get_db_session
 
@@ -301,14 +316,58 @@ async def process_direct_upload_task(
         except Exception as e:
             logger.error(f"S3 upload error: {e}")
 
+    async def generate_and_upload_thumbnail():
+        """Extract thumbnail from video and upload to S3."""
+        try:
+            # Extract thumbnail from video
+            thumbnail_path = await extract_thumbnail(local_path, timestamp=1.0)
+            if not thumbnail_path:
+                logger.warning(f"Failed to extract thumbnail for model {model_id}")
+                return
+
+            # Generate S3 key for thumbnail
+            thumbnail_s3_key = s3_service.generate_s3_key(
+                user_id=str(user_id),
+                filename=f"{model_id}.jpg",
+                media_type="thumbnails",
+                unique_id=str(model_id),
+            )
+
+            # Upload thumbnail to S3
+            success = await s3_service.upload_file(
+                thumbnail_path, thumbnail_s3_key, content_type="image/jpeg"
+            )
+
+            if success:
+                logger.info(f"Thumbnail uploaded: {thumbnail_s3_key}")
+                # Update model with thumbnail key
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VideoModel).where(VideoModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.thumbnail_key = thumbnail_s3_key
+                        await db.commit()
+            else:
+                logger.error(f"Thumbnail upload failed: {thumbnail_s3_key}")
+
+            # Clean up temp thumbnail file
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                os.remove(thumbnail_path)
+
+        except Exception as e:
+            logger.error(f"Thumbnail generation error: {e}")
+
     async def generate_avatar():
         """Process avatar generation."""
         async with get_db_session() as db:
             await avatar_job_service.process_pending_jobs(db)
 
-    # Run S3 upload and avatar generation in parallel
+    # Run S3 upload, thumbnail generation, and avatar generation in parallel
     await asyncio.gather(
         upload_to_s3(),
+        generate_and_upload_thumbnail(),
         generate_avatar(),
         return_exceptions=True,
     )
@@ -400,6 +459,15 @@ async def complete_upload(
         process_avatar_jobs_task,
     )
 
+    # Generate thumbnail if not already present
+    if not model.thumbnail_key and model.source_video_key:
+        background_tasks.add_task(
+            generate_thumbnail_task,
+            model_id=model.id,
+            user_id=user.id,
+            video_s3_key=model.source_video_key,
+        )
+
     return {
         "model": VideoModelBrief.model_validate(model).model_dump(),
         "job_id": str(job.id),
@@ -413,6 +481,75 @@ async def process_avatar_jobs_task():
 
     async with get_db_session() as db:
         await avatar_job_service.process_pending_jobs(db)
+
+
+async def generate_thumbnail_task(
+    model_id: UUID,
+    user_id: int,
+    video_s3_key: str,
+):
+    """
+    Background task to generate and upload thumbnail for a video model.
+    Downloads video from S3 if needed, extracts thumbnail, uploads to S3.
+    """
+    import tempfile
+    from app.db import get_db_session
+
+    temp_video_path = None
+    thumbnail_path = None
+
+    try:
+        # Download video from S3 to temp file
+        ext = os.path.splitext(video_s3_key)[1] or ".mp4"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            temp_video_path = tmp.name
+
+        success = await s3_service.download_file(video_s3_key, temp_video_path)
+        if not success:
+            logger.error(f"Failed to download video for thumbnail: {video_s3_key}")
+            return
+
+        # Extract thumbnail
+        thumbnail_path = await extract_thumbnail(temp_video_path, timestamp=1.0)
+        if not thumbnail_path:
+            logger.warning(f"Failed to extract thumbnail for model {model_id}")
+            return
+
+        # Generate S3 key for thumbnail
+        thumbnail_s3_key = s3_service.generate_s3_key(
+            user_id=str(user_id),
+            filename=f"{model_id}.jpg",
+            media_type="thumbnails",
+            unique_id=str(model_id),
+        )
+
+        # Upload thumbnail to S3
+        success = await s3_service.upload_file(
+            thumbnail_path, thumbnail_s3_key, content_type="image/jpeg"
+        )
+
+        if success:
+            logger.info(f"Thumbnail uploaded: {thumbnail_s3_key}")
+            # Update model with thumbnail key
+            async with get_db_session() as db:
+                result = await db.execute(
+                    select(VideoModel).where(VideoModel.id == model_id)
+                )
+                model = result.scalar_one_or_none()
+                if model:
+                    model.thumbnail_key = thumbnail_s3_key
+                    await db.commit()
+        else:
+            logger.error(f"Thumbnail upload failed: {thumbnail_s3_key}")
+
+    except Exception as e:
+        logger.error(f"Thumbnail generation task error: {e}")
+    finally:
+        # Clean up temp files
+        if temp_video_path and os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
+        if thumbnail_path and os.path.exists(thumbnail_path):
+            os.remove(thumbnail_path)
 
 
 @router.post("/{model_id}/avatar-ready", response_model=dict)

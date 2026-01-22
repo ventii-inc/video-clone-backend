@@ -32,7 +32,8 @@ class VideoModel(Base):
     local_video_path = Column(String(500), nullable=True)  # Local file path for CLI processing
     model_data_url = Column(String(500), nullable=True)  # Presigned URL for model data
     model_data_key = Column(String(500), nullable=True)  # S3 key for avatar TAR file
-    thumbnail_url = Column(String(500), nullable=True)
+    thumbnail_url = Column(String(500), nullable=True)  # Deprecated: use thumbnail_key
+    thumbnail_key = Column(String(500), nullable=True)  # S3 key for thumbnail
     duration_seconds = Column(Integer, nullable=True)
     file_size_bytes = Column(Integer, nullable=True)
     status = Column(String(20), default=ModelStatus.PENDING.value, nullable=False, index=True)

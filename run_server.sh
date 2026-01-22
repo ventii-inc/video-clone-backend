@@ -34,8 +34,29 @@ case "$1" in
             echo "Server is not running"
         fi
         ;;
+    upgrade)
+        echo "=== Upgrading server ==="
+
+        # Pull latest code
+        echo "Pulling latest code..."
+        git pull || { echo "Git pull failed"; exit 1; }
+
+        # Sync dependencies
+        echo "Syncing dependencies..."
+        uv sync || { echo "uv sync failed"; exit 1; }
+
+        # Run database migrations
+        echo "Running database migrations (ENV=${ENV})..."
+        uv run alembic upgrade head || { echo "Alembic upgrade failed"; exit 1; }
+
+        # Restart server
+        echo "Restarting server..."
+        $0 restart
+
+        echo "=== Upgrade complete ==="
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|logs|status}"
+        echo "Usage: $0 {start|stop|restart|upgrade|logs|status}"
         echo "Environment: ENV=${ENV} (override with ENV=local $0 start)"
         exit 1
         ;;

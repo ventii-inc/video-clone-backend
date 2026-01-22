@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,80 @@ async def trim_video(
     except Exception as e:
         logger.error(f"Error trimming video: {e}")
         return False
+
+
+async def extract_thumbnail(
+    video_path: str,
+    output_path: Optional[str] = None,
+    timestamp: float = 1.0,
+) -> Optional[str]:
+    """
+    Extract a single frame from a video as a thumbnail.
+
+    Args:
+        video_path: Path to the video file
+        output_path: Path for the output image (defaults to temp file)
+        timestamp: Time in seconds to extract frame from (default: 1.0)
+
+    Returns:
+        Path to the generated thumbnail, or None if extraction failed
+    """
+    if not os.path.exists(video_path):
+        logger.error(f"Video file not found: {video_path}")
+        return None
+
+    # Generate output path if not provided
+    if output_path is None:
+        fd, output_path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+
+    try:
+        # Get video duration first to ensure we don't seek past the end
+        duration = await get_video_duration(video_path)
+        if duration is not None and timestamp > duration:
+            # Use 10% into the video if timestamp exceeds duration
+            timestamp = min(1.0, duration * 0.1)
+
+        # Using ffmpeg to extract a single frame
+        # -ss before -i for fast seeking
+        # -vframes 1 to extract only one frame
+        # -q:v 2 for high quality JPEG
+        # Arguments passed as list to create_subprocess_exec (not shell) for security
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-ss", str(timestamp),
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            output_path,
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"FFmpeg thumbnail extraction failed: {stderr.decode()}")
+            return None
+
+        # Verify output file exists and has content
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            logger.error(f"Thumbnail not created or empty: {output_path}")
+            return None
+
+        logger.info(f"Thumbnail extracted successfully: {output_path}")
+        return output_path
+
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Please install FFmpeg.")
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting thumbnail: {e}")
+        return None
 
 
 class VideoService:
