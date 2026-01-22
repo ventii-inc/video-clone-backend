@@ -123,6 +123,13 @@ class GenerationStatusDetail(BaseModel):
         from_attributes = True
 
 
+class DownloadUrlResponse(BaseModel):
+    """Response for video download URL"""
+    download_url: str
+    file_name: str
+    expires_in_seconds: int = 3600
+
+
 # Update forward references
 GenerateVideoResponse.model_rebuild()
 GenerationStatusResponse.model_rebuild()

@@ -139,6 +139,7 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 |--------|------|-------------|
 | GET | `/videos` | List generated videos (paginated, includes video URLs) |
 | GET | `/videos/{id}` | Get video details with fresh presigned URL |
+| GET | `/videos/{id}/download` | Get presigned download URL (avoids CORS) |
 | DELETE | `/videos/{id}` | Delete generated video |
 | POST | `/videos/{id}/regenerate` | Regenerate with same settings |
 
@@ -147,7 +148,8 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 **Video URLs:**
 - `output_video_url` - Presigned S3 URL (included in list and detail responses)
 - URLs are generated on-demand and expire in 1 hour
-- Use `<video src="url">` for streaming, `<a href="url" download>` for download
+- Use `<video src="url">` for streaming
+- Use `/download` endpoint for downloading (returns `download_url`, `file_name`)
 
 ---
 
