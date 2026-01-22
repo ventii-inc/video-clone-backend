@@ -213,15 +213,16 @@ async def get_download_url(
             detail="Video file not found",
         )
 
-    # Generate fresh presigned URL
-    download_url = await s3_service.generate_presigned_url(
-        video.output_video_key,
-        expiration=3600,
-    )
-
     # Generate filename
     title_slug = (video.title or "video").lower().replace(" ", "-")[:50]
     filename = f"{title_slug}-{str(video.id)[:8]}.mp4"
+
+    # Generate fresh presigned URL with Content-Disposition header for download
+    download_url = await s3_service.generate_presigned_url(
+        video.output_video_key,
+        expiration=3600,
+        content_disposition=f'attachment; filename="{filename}"',
+    )
 
     return DownloadUrlResponse(
         download_url=download_url,
