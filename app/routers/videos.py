@@ -310,7 +310,10 @@ async def regenerate_video(
             },
         )
 
-    # Create new video record
+    # Get current usage record for response (no deduction yet - will deduct after generation)
+    usage_record = await usage_service.get_or_create_current_usage(user.id, db)
+
+    # Create new video record (credits_used will be set after generation completes)
     new_video = GeneratedVideo(
         user_id=user.id,
         video_model_id=original.video_model_id,
@@ -319,16 +322,13 @@ async def regenerate_video(
         input_text=original.input_text,
         input_text_language=original.input_text_language,
         resolution=original.resolution,
-        credits_used=credits_needed,
+        credits_used=0,  # Will be updated with actual duration after generation
         status=GenerationStatus.QUEUED.value,
         queue_position=1,
     )
     db.add(new_video)
     await db.commit()
     await db.refresh(new_video)
-
-    # Deduct credits
-    usage_record = await usage_service.deduct_credits(user.id, credits_needed, db)
 
     # Start generation
     background_tasks.add_task(
@@ -342,7 +342,7 @@ async def regenerate_video(
             title=new_video.title,
             status=new_video.status,
             queue_position=new_video.queue_position,
-            credits_used=new_video.credits_used,
+            credits_used=credits_needed,  # Estimated - actual will be based on output duration
             created_at=new_video.created_at,
         ),
         usage=UsageInfo(
