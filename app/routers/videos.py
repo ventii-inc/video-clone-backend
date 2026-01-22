@@ -1,5 +1,6 @@
 """Generated videos router for managing generated videos"""
 
+import asyncio
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -19,7 +20,6 @@ from app.schemas.generated_video import (
     GeneratedVideoResponse,
     GeneratedVideoListItem,
     GeneratedVideoListResponse,
-    DownloadUrlResponse,
     GenerateVideoRequest,
     GenerateVideoResponse,
     GeneratedVideoBrief,
@@ -80,14 +80,26 @@ async def list_videos(
     result = await db.execute(query)
     videos = result.scalars().all()
 
-    # Build response
+    # Generate presigned URLs in parallel for completed videos
+    async def get_presigned_url(video):
+        if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+            try:
+                return await s3_service.generate_presigned_url(video.output_video_key)
+            except Exception:
+                return None
+        return None
+
+    urls = await asyncio.gather(*[get_presigned_url(v) for v in videos])
+
+    # Build response with URLs
     items = []
-    for video in videos:
+    for video, url in zip(videos, urls):
         items.append(
             GeneratedVideoListItem(
                 id=video.id,
                 title=video.title,
                 thumbnail_url=video.thumbnail_url,
+                output_video_url=url,
                 duration_seconds=video.duration_seconds,
                 resolution=video.resolution,
                 status=video.status,
@@ -136,12 +148,20 @@ async def get_video(
             detail="Generated video not found",
         )
 
+    # Generate fresh presigned URL for completed videos
+    output_video_url = None
+    if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+        try:
+            output_video_url = await s3_service.generate_presigned_url(video.output_video_key)
+        except Exception:
+            pass
+
     return GeneratedVideoResponse(
         id=video.id,
         title=video.title,
         input_text=video.input_text,
         input_text_language=video.input_text_language,
-        output_video_url=video.output_video_url,
+        output_video_url=output_video_url,
         thumbnail_url=video.thumbnail_url,
         duration_seconds=video.duration_seconds,
         file_size_bytes=video.file_size_bytes,
@@ -154,58 +174,6 @@ async def get_video(
         processing_started_at=video.processing_started_at,
         processing_completed_at=video.processing_completed_at,
         created_at=video.created_at,
-    )
-
-
-@router.get("/{video_id}/download", response_model=DownloadUrlResponse)
-async def get_download_url(
-    video_id: UUID,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Get a fresh presigned URL for downloading the video.
-    """
-    result = await db.execute(
-        select(GeneratedVideo).where(
-            GeneratedVideo.id == video_id,
-            GeneratedVideo.user_id == user.id,
-        )
-    )
-    video = result.scalar_one_or_none()
-
-    if not video:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Generated video not found",
-        )
-
-    if video.status != GenerationStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Video is not ready for download",
-        )
-
-    if not video.output_video_key:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Video file not found",
-        )
-
-    # Generate fresh presigned URL
-    download_url = await s3_service.generate_presigned_url(
-        video.output_video_key,
-        expires_in=3600,
-    )
-
-    # Generate filename
-    title_slug = (video.title or "video").lower().replace(" ", "-")[:50]
-    filename = f"{title_slug}-{str(video.id)[:8]}.mp4"
-
-    return DownloadUrlResponse(
-        download_url=download_url,
-        file_name=filename,
-        expires_in_seconds=3600,
     )
 
 

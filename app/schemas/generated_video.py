@@ -81,6 +81,7 @@ class GeneratedVideoListItem(BaseModel):
     id: UUID
     title: str | None
     thumbnail_url: str | None
+    output_video_url: str | None
     duration_seconds: int | None
     resolution: Resolution
     status: GenerationStatus
@@ -120,13 +121,6 @@ class GenerationStatusDetail(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class DownloadUrlResponse(BaseModel):
-    """Response for video download URL"""
-    download_url: str
-    file_name: str
-    expires_in_seconds: int = 3600
 
 
 # Update forward references
