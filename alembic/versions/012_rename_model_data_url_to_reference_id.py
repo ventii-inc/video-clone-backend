@@ -1,7 +1,7 @@
 """Rename model_data_url to reference_id in voice_models
 
-Revision ID: 012
-Revises: 011
+Revision ID: c3d4e5f6g7h8
+Revises: b2c3d4e5f6g7
 Create Date: 2024-01-23
 
 """
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision = '012'
-down_revision = '011'
+revision: str = 'c3d4e5f6g7h8'
+down_revision: str = 'b2c3d4e5f6g7'
 branch_labels = None
 depends_on = None
 
