@@ -58,6 +58,29 @@ class FishAudioService:
         """Check if Fish Audio is properly configured"""
         return bool(self.api_key)
 
+    def _detect_audio_format(self, audio_data: bytes) -> tuple[str, str]:
+        """
+        Detect audio format from file magic bytes.
+
+        Returns:
+            Tuple of (filename_extension, mime_type)
+        """
+        # Check magic bytes for common audio formats
+        if audio_data[:4] == b"RIFF" and audio_data[8:12] == b"WAVE":
+            return "audio.wav", "audio/wav"
+        elif audio_data[:3] == b"ID3" or (audio_data[:2] == b"\xff\xfb"):
+            return "audio.mp3", "audio/mpeg"
+        elif audio_data[4:8] == b"ftyp":
+            # M4A/MP4 container
+            return "audio.m4a", "audio/mp4"
+        elif audio_data[:4] == b"fLaC":
+            return "audio.flac", "audio/flac"
+        elif audio_data[:4] == b"OggS":
+            return "audio.ogg", "audio/ogg"
+        else:
+            # Default to WAV
+            return "audio.wav", "audio/wav"
+
     async def clone_voice(
         self,
         audio_data: bytes,
@@ -96,12 +119,18 @@ class FishAudioService:
             async with httpx.AsyncClient(
                 timeout=self.settings.FISH_AUDIO_TIMEOUT
             ) as client:
+                # Detect audio format from bytes
+                filename, mime_type = self._detect_audio_format(audio_data)
+                logger.info(f"Detected audio format: {filename} ({mime_type})")
+
                 # Prepare multipart form data
-                files = {"voices": ("audio.wav", audio_data, "audio/wav")}
+                files = {"voices": (filename, audio_data, mime_type)}
 
                 data = {
                     "title": title,
                     "visibility": visibility,
+                    "type": "tts",
+                    "train_mode": "fast",
                     "enhance_audio_quality": str(enhance_quality).lower(),
                 }
 
@@ -333,6 +362,70 @@ class FishAudioService:
         except Exception as e:
             logger.error(f"Failed to delete Fish Audio model: {e}")
             return False
+
+    async def update_model(
+        self,
+        model_id: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        visibility: Optional[str] = None,
+    ) -> dict:
+        """
+        Update a voice model's metadata.
+
+        Args:
+            model_id: Fish Audio model ID
+            title: New title (optional)
+            description: New description (optional)
+            visibility: New visibility - "private", "public", or "unlist" (optional)
+
+        Returns:
+            Dict with success status and updated model info or error
+        """
+        if not self.is_configured():
+            return {"success": False, "error": "Fish Audio API key not configured"}
+
+        try:
+            data = {}
+            if title is not None:
+                data["title"] = title
+            if description is not None:
+                data["description"] = description
+            if visibility is not None:
+                data["visibility"] = visibility
+
+            if not data:
+                return {"success": False, "error": "No fields to update"}
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = self._get_headers()
+                headers["Content-Type"] = "application/json"
+
+                response = await client.patch(
+                    f"{self.base_url}/model/{model_id}",
+                    headers=headers,
+                    json=data,
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"Fish Audio model updated: {model_id}")
+                    return {"success": True, "model": result}
+                else:
+                    error_msg = f"Fish Audio API error: {response.status_code}"
+                    try:
+                        error_data = response.json()
+                        if "detail" in error_data:
+                            error_msg = f"{error_msg} - {error_data['detail']}"
+                    except Exception:
+                        pass
+                    logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            error_msg = f"Failed to update Fish Audio model: {e}"
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
 
 
 # Singleton instance

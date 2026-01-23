@@ -289,22 +289,36 @@ class AIService:
 
         try:
             # Process training audio: download (or use local file), trim if needed, re-upload
-            await self._process_training_audio(model, db, local_audio_path=local_audio_path)
-
-            # Get presigned URL for the (possibly trimmed) source audio
-            if not model.source_audio_key:
-                raise ValueError("No source audio key found")
-
-            audio_url = await s3_service.generate_presigned_url(
-                model.source_audio_key, expiration=3600
+            # Returns the path to the processed audio file for local cloning
+            processed_audio_path = await self._process_training_audio(
+                model, db, local_audio_path=local_audio_path
             )
 
             # Clone voice using Fish Audio
-            clone_result = await fish_audio_service.clone_voice_from_url(
-                audio_url=audio_url,
-                title=model.name,
-                description=f"Voice model for user {model.user_id}",
-            )
+            # Prefer using local file directly (avoids S3 race condition)
+            if processed_audio_path and os.path.exists(processed_audio_path):
+                logger.info(f"Using local audio file for Fish Audio cloning: {processed_audio_path}")
+                with open(processed_audio_path, "rb") as f:
+                    audio_data = f.read()
+                clone_result = await fish_audio_service.clone_voice(
+                    audio_data=audio_data,
+                    title=model.name,
+                    description=f"Voice model for user {model.user_id}",
+                )
+            else:
+                # Fallback: download from S3 (for presigned upload flow where no local file exists)
+                if not model.source_audio_key:
+                    raise ValueError("No source audio key found")
+
+                logger.info(f"Falling back to S3 URL for Fish Audio cloning: {model.source_audio_key}")
+                audio_url = await s3_service.generate_presigned_url(
+                    model.source_audio_key, expiration=3600
+                )
+                clone_result = await fish_audio_service.clone_voice_from_url(
+                    audio_url=audio_url,
+                    title=model.name,
+                    description=f"Voice model for user {model.user_id}",
+                )
 
             if not clone_result.success:
                 raise ValueError(clone_result.error or "Voice cloning failed")
@@ -326,13 +340,22 @@ class AIService:
             model.error_message = str(e)[:500]
             model.processing_completed_at = datetime.utcnow()
             await db.commit()
+        finally:
+            # Clean up temp directory if it was created
+            if hasattr(self, '_temp_audio_dir') and self._temp_audio_dir:
+                import shutil
+                try:
+                    shutil.rmtree(self._temp_audio_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                self._temp_audio_dir = None
 
     async def _process_training_audio(
         self,
         model: VoiceModel,
         db: AsyncSession,
         local_audio_path: str | None = None,
-    ) -> None:
+    ) -> str | None:
         """
         Download (or use local file), trim (if needed), and re-upload training audio.
 
@@ -342,71 +365,81 @@ class AIService:
             model: Voice model to process
             db: Database session
             local_audio_path: Optional path to local audio file (skips S3 download)
+
+        Returns:
+            Path to processed audio file (for use in Fish Audio cloning), or None if no audio
         """
         if not model.source_audio_key and not local_audio_path:
             logger.warning(f"No source audio key or local path for model {model.id}")
-            return
+            return None
 
-        # Create temp directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Determine file extension from s3 key or local path
-            source_path = local_audio_path or model.source_audio_key
-            ext = os.path.splitext(source_path)[1] or ".wav"
-            output_path = os.path.join(temp_dir, f"output{ext}")
+        # Create temp directory for processing (using instance variable to persist during cloning)
+        self._temp_audio_dir = tempfile.mkdtemp()
+        temp_dir = self._temp_audio_dir
 
-            # Use local file if provided, otherwise download from S3
-            if local_audio_path and os.path.exists(local_audio_path):
-                input_path = local_audio_path
-                logger.info(f"Using local audio file: {local_audio_path}")
-            else:
-                input_path = os.path.join(temp_dir, f"input{ext}")
-                # Download audio from S3
-                logger.info(f"Downloading audio from S3: {model.source_audio_key}")
-                success = await s3_service.download_file(model.source_audio_key, input_path)
+        # Determine file extension from s3 key or local path
+        source_path = local_audio_path or model.source_audio_key
+        ext = os.path.splitext(source_path)[1] or ".wav"
+        output_path = os.path.join(temp_dir, f"output{ext}")
 
-                if not success:
-                    raise ValueError(f"Failed to download audio from S3: {model.source_audio_key}")
+        # Use local file if provided, otherwise download from S3
+        if local_audio_path and os.path.exists(local_audio_path):
+            input_path = local_audio_path
+            logger.info(f"Using local audio file: {local_audio_path}")
+        else:
+            input_path = os.path.join(temp_dir, f"input{ext}")
+            # Download audio from S3
+            logger.info(f"Downloading audio from S3: {model.source_audio_key}")
+            success = await s3_service.download_file(model.source_audio_key, input_path)
 
-            # Process (trim if needed)
-            try:
-                final_path, duration, was_trimmed = await audio_service.process_training_audio(
-                    input_path, output_path
+            if not success:
+                raise ValueError(f"Failed to download audio from S3: {model.source_audio_key}")
+
+        # Process (trim if needed)
+        try:
+            final_path, duration, was_trimmed = await audio_service.process_training_audio(
+                input_path, output_path
+            )
+
+            # Update duration on model
+            model.duration_seconds = int(duration)
+
+            if was_trimmed:
+                logger.info(f"Audio was trimmed to {duration}s, re-uploading to S3")
+
+                # Get file size of trimmed audio
+                model.file_size_bytes = os.path.getsize(final_path)
+
+                # Re-upload trimmed audio to same S3 key
+                content_type = s3_service._get_content_type(final_path)
+                await s3_service.upload_file(
+                    final_path,
+                    model.source_audio_key,
+                    content_type=content_type,
                 )
+                logger.info(f"Trimmed audio uploaded to S3: {model.source_audio_key}")
+            else:
+                logger.info(f"Audio duration is {duration}s, no trimming needed")
+                # Update file size from original
+                model.file_size_bytes = os.path.getsize(input_path)
 
-                # Update duration on model
+            await db.commit()
+
+            # Return the path to the processed audio file for Fish Audio cloning
+            return final_path
+
+        except ValueError as e:
+            # If trimming fails but we can still get duration, continue
+            duration = await get_audio_duration(input_path)
+            if duration:
                 model.duration_seconds = int(duration)
-
-                if was_trimmed:
-                    logger.info(f"Audio was trimmed to {duration}s, re-uploading to S3")
-
-                    # Get file size of trimmed audio
-                    model.file_size_bytes = os.path.getsize(final_path)
-
-                    # Re-upload trimmed audio to same S3 key
-                    content_type = s3_service._get_content_type(final_path)
-                    await s3_service.upload_file(
-                        final_path,
-                        model.source_audio_key,
-                        content_type=content_type,
-                    )
-                    logger.info(f"Trimmed audio uploaded to S3: {model.source_audio_key}")
-                else:
-                    logger.info(f"Audio duration is {duration}s, no trimming needed")
-                    # Update file size from original
-                    model.file_size_bytes = os.path.getsize(input_path)
-
+                model.file_size_bytes = os.path.getsize(input_path)
                 await db.commit()
-
-            except ValueError as e:
-                # If trimming fails but we can still get duration, continue
-                duration = await get_audio_duration(input_path)
-                if duration:
-                    model.duration_seconds = int(duration)
-                    model.file_size_bytes = os.path.getsize(input_path)
-                    await db.commit()
-                    logger.warning(f"Trim failed but continuing with original audio: {e}")
-                else:
-                    raise
+                logger.warning(f"Trim failed but continuing with original audio: {e}")
+                # Return the input path if trimming failed
+                return input_path
+            else:
+                raise
 
     async def _process_voice_model_mock(
         self,
