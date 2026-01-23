@@ -42,6 +42,13 @@ ALLOWED_VIDEO_TYPES = ["video/mp4", "video/quicktime", "video/x-msvideo", "video
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
 
 
+def map_public_status(status: str) -> str:
+    """Map internal status to public API status (processing/completed/failed)."""
+    if status in ("pending", "uploading", "processing"):
+        return "processing"
+    return status  # completed, failed stay the same
+
+
 @router.get("", response_model=VideoModelListResponse)
 async def list_video_models(
     status: str | None = None,
@@ -56,16 +63,8 @@ async def list_video_models(
     total_start = time.perf_counter()
     timings = {}
 
-    # Build query - only show processing, completed, and failed statuses
-    VISIBLE_STATUSES = [
-        ModelStatus.PROCESSING.value,
-        ModelStatus.COMPLETED.value,
-        ModelStatus.FAILED.value,
-    ]
-    query = select(VideoModel).where(
-        VideoModel.user_id == user.id,
-        VideoModel.status.in_(VISIBLE_STATUSES)
-    )
+    # Build query - show all models for the user
+    query = select(VideoModel).where(VideoModel.user_id == user.id)
 
     if status:
         query = query.where(VideoModel.status == status)
@@ -92,6 +91,8 @@ async def list_video_models(
     thumbnail_timings = []
     for m in models:
         brief = VideoModelBrief.model_validate(m)
+        # Map internal status to public status (pending/uploading → processing)
+        brief.status = map_public_status(m.status)
         # Generate thumbnail URL from thumbnail_key if available
         if m.thumbnail_key:
             t_thumb = time.perf_counter()
