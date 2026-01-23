@@ -19,8 +19,12 @@ from sqlalchemy import select
 
 from app.models.video_model import VideoModel, ModelStatus as VideoModelStatus
 from app.models.voice_model import VoiceModel, ModelStatus as VoiceModelStatus
-from app.models.generated_video import GeneratedVideo, GenerationStatus
+from app.models.generated_video import GeneratedVideo, GenerationStatus, VideoGenerationStage
+from app.services.progress import calculate_training_progress
+from app.db import get_db_session
+from app.models.user import User
 from app.services.s3 import s3_service
+from app.services.email import VideoGenerationCompletionData, get_email_service
 from app.services.usage_service import usage_service
 from app.services.video import video_service, get_video_duration
 from app.services.audio import audio_service, get_audio_duration
@@ -49,6 +53,9 @@ class AIService:
     VOICE_MODEL_PROCESSING_TIME = 3  # Real: 2-10 minutes
     VIDEO_GENERATION_TIME = 4  # Real: varies by text length
 
+    # Expected video generation time for progress calculation (seconds)
+    EXPECTED_VIDEO_GENERATION_TIME = 60  # Typical video generation takes ~60 seconds
+
     def _calculate_minutes_from_duration(self, duration_seconds: int | None) -> int:
         """Calculate billable minutes from video duration in seconds.
 
@@ -58,6 +65,34 @@ class AIService:
             return 1  # Minimum 1 minute charge
         # Round up to nearest minute
         return max(1, (duration_seconds + 59) // 60)
+
+    async def _send_video_completion_email(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Send email notification when video generation completes."""
+        try:
+            # Fetch user for email notification
+            user_result = await db.execute(
+                select(User).where(User.id == video.user_id)
+            )
+            user = user_result.scalar_one_or_none()
+
+            if user and user.email:
+                email_service = get_email_service()
+                await email_service.send_video_generation_completion_email(
+                    to_email=user.email,
+                    data=VideoGenerationCompletionData(
+                        user_name=user.name or user.email.split("@")[0],
+                        video_title=video.title or "Untitled Video",
+                        duration_seconds=video.duration_seconds,
+                        dashboard_url="https://ventii.jp/dashboard/videos",
+                    ),
+                )
+                logger.info(f"Sent video completion email to {user.email} for video {video.id}")
+        except Exception as e:
+            logger.warning(f"Failed to send video completion email for video {video.id}: {e}")
 
     async def _deduct_credits_for_video(
         self,
@@ -271,7 +306,7 @@ class AIService:
             # Store Fish Audio model ID
             model.status = VoiceModelStatus.COMPLETED.value
             model.processing_completed_at = datetime.utcnow()
-            model.model_data_url = clone_result.model_id  # Store Fish Audio model ID
+            model.reference_id = clone_result.model_id  # Store Fish Audio model ID
 
             await db.commit()
             logger.info(
@@ -365,7 +400,7 @@ class AIService:
 
         model.status = VoiceModelStatus.COMPLETED.value
         model.processing_completed_at = datetime.utcnow()
-        model.model_data_url = f"mock://fish-audio/{model.id}"
+        model.reference_id = f"mock://fish-audio/{model.id}"
 
         await db.commit()
         logger.info(f"Mock voice model processing completed: {model.id}")
@@ -401,6 +436,8 @@ class AIService:
 
         # Update status to processing
         video.status = GenerationStatus.PROCESSING.value
+        video.processing_stage = VideoGenerationStage.PREPARING.value
+        video.progress_percent = 5
         video.processing_started_at = datetime.utcnow()
         video.queue_position = None
         await db.commit()
@@ -412,13 +449,69 @@ class AIService:
         else:
             await self._generate_video_mock(video, db)
 
+    async def _run_video_progress_updater(
+        self,
+        video_id: UUID,
+        expected_seconds: float = None,
+    ) -> None:
+        """
+        Periodically update video generation progress using asymptotic formula.
+
+        This runs concurrently with the actual generation, updating progress
+        from 20% toward 78% (never reaching 80% until actual completion).
+        Uses its own DB session since the main session is held during CLI.
+        """
+        if expected_seconds is None:
+            expected_seconds = self.EXPECTED_VIDEO_GENERATION_TIME
+
+        start_time = datetime.utcnow()
+
+        while True:
+            try:
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                # Calculate progress from 20-78% (asymptotic, slows down)
+                progress = calculate_training_progress(
+                    elapsed_seconds=elapsed,
+                    expected_seconds=expected_seconds,
+                    start_percent=20,
+                    max_percent=78,  # Cap at 78%, leaving room for 80-100% on completion
+                )
+
+                # Update in DB using fresh session
+                async with get_db_session() as update_db:
+                    result = await update_db.execute(
+                        select(GeneratedVideo).where(GeneratedVideo.id == video_id)
+                    )
+                    video = result.scalar_one_or_none()
+                    if video and video.status == GenerationStatus.PROCESSING.value:
+                        video.progress_percent = progress
+                        await update_db.commit()
+                        logger.debug(f"Video {video_id} progress: {progress}%")
+
+                await asyncio.sleep(2)  # Update every 2 seconds
+
+            except asyncio.CancelledError:
+                # Task was cancelled (generation completed)
+                logger.debug(f"Progress updater cancelled for video {video_id}")
+                raise
+            except Exception as e:
+                logger.warning(f"Error updating video progress: {e}")
+                await asyncio.sleep(2)  # Continue despite errors
+
     async def _generate_video_cli(
         self,
         video: GeneratedVideo,
         db: AsyncSession,
     ) -> None:
         """Generate video using LiveTalking CLI."""
+        progress_task = None
+
         try:
+            # Set preparing stage
+            video.processing_stage = VideoGenerationStage.PREPARING.value
+            video.progress_percent = 10
+            await db.commit()
+
             # Get the video model to get avatar_id
             video_model_result = await db.execute(
                 select(VideoModel).where(VideoModel.id == video.video_model_id)
@@ -430,10 +523,6 @@ class AIService:
 
             avatar_id = str(video.video_model_id)
 
-            # Update progress
-            video.progress_percent = 10
-            await db.commit()
-
             # Generate output path
             output_filename = f"{video.id}.mp4"
             output_path = os.path.join(tempfile.gettempdir(), output_filename)
@@ -443,11 +532,17 @@ class AIService:
                 select(VoiceModel).where(VoiceModel.id == video.voice_model_id)
             )
             voice_model = voice_model_result.scalar_one_or_none()
-            ref_file = voice_model.model_data_url if voice_model else None
+            ref_file = voice_model.reference_id if voice_model else None
 
-            # Update progress
+            # Update to generating stage and start progress updater
+            video.processing_stage = VideoGenerationStage.GENERATING.value
             video.progress_percent = 20
             await db.commit()
+
+            # Start concurrent progress updater
+            progress_task = asyncio.create_task(
+                self._run_video_progress_updater(video.id)
+            )
 
             # Run CLI video generation
             logger.info(f"Running CLI video generation for {video.id}")
@@ -460,11 +555,20 @@ class AIService:
                 upload_to_s3=True,
             )
 
+            # Cancel progress updater now that generation is complete
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
             if not result.success:
                 raise ValueError(result.error or "Video generation failed")
 
-            # Update video record with results
+            # Update video record with results - COMPLETED
             video.status = GenerationStatus.COMPLETED.value
+            video.processing_stage = VideoGenerationStage.COMPLETED.value
             video.processing_completed_at = datetime.utcnow()
             video.progress_percent = 100
             video.duration_seconds = int(result.duration) if result.duration else None
@@ -481,11 +585,23 @@ class AIService:
             # Deduct credits based on actual video duration
             await self._deduct_credits_for_video(video, db)
 
+            # Send email notification
+            await self._send_video_completion_email(video, db)
+
             logger.info(f"CLI video generation completed: {video.id}")
 
         except Exception as e:
+            # Cancel progress updater on error
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
             logger.error(f"CLI video generation failed: {e}")
             video.status = GenerationStatus.FAILED.value
+            video.processing_stage = VideoGenerationStage.FAILED.value
             video.error_message = str(e)[:500]
             video.processing_completed_at = datetime.utcnow()
             await db.commit()
@@ -496,6 +612,9 @@ class AIService:
         db: AsyncSession,
     ) -> None:
         """Generate video using mock implementation (for development)."""
+        # Set generating stage
+        video.processing_stage = VideoGenerationStage.GENERATING.value
+
         # Simulate progress updates
         for progress in [25, 50, 75, 100]:
             await asyncio.sleep(self.VIDEO_GENERATION_TIME / 4)
@@ -509,6 +628,7 @@ class AIService:
 
         # Mock success
         video.status = GenerationStatus.COMPLETED.value
+        video.processing_stage = VideoGenerationStage.COMPLETED.value
         video.processing_completed_at = datetime.utcnow()
         video.progress_percent = 100
         video.duration_seconds = estimated_duration
@@ -521,6 +641,9 @@ class AIService:
 
         # Deduct credits based on actual video duration
         await self._deduct_credits_for_video(video, db)
+
+        # Send email notification
+        await self._send_video_completion_email(video, db)
 
         logger.info(f"Mock video generation completed: {video.id}")
 

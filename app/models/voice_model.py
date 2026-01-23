@@ -17,6 +17,7 @@ class ModelStatus(str, PyEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    INCOMPLETE = "incomplete"
 
 
 class SourceType(str, PyEnum):
@@ -40,7 +41,7 @@ class VoiceModel(Base):
     name = Column(String(100), nullable=False)
     source_audio_url = Column(String(500), nullable=True)
     source_audio_key = Column(String(500), nullable=True)  # S3 key
-    model_data_url = Column(String(500), nullable=True)  # Processed model from AI
+    reference_id = Column(String(500), nullable=True)  # Fish Audio model ID
     source_type = Column(String(20), default=SourceType.UPLOAD.value, nullable=False)
     duration_seconds = Column(Integer, nullable=True)
     file_size_bytes = Column(Integer, nullable=True)

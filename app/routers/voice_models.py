@@ -447,8 +447,8 @@ async def update_voice_model(
         )
 
     # Update Fish Audio model if visibility is being changed and model is completed
-    if data.visibility is not None and model.model_data_url and model.status == "completed":
-        fish_audio_id = model.model_data_url
+    if data.visibility is not None and model.reference_id and model.status == "completed":
+        fish_audio_id = model.reference_id
         # Skip if it's a mock model
         if not fish_audio_id.startswith("mock://"):
             update_result = await fish_audio_service.update_model(
