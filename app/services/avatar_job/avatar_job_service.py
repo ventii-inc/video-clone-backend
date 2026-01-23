@@ -265,6 +265,7 @@ class AvatarJobService:
         server restarts. We store the PID and output file path for tracking.
 
         Uses local video file if available, otherwise downloads from S3.
+        Auto-recovers stuck uploads: if local exists but S3 doesn't, uploads first.
         Returns immediately after spawning the process (fire-and-forget).
         """
         try:
@@ -272,6 +273,23 @@ class AvatarJobService:
             if video_model.local_video_path and os.path.exists(video_model.local_video_path):
                 video_path = video_model.local_video_path
                 logger.info(f"Using local video file: {video_path}")
+
+                # Auto-recover: if local exists but S3 doesn't, upload now
+                if video_model.source_video_key:
+                    s3_exists = await s3_service.file_exists(video_model.source_video_key)
+                    if not s3_exists:
+                        logger.info(f"S3 file missing, uploading from local: {video_model.source_video_key}")
+                        await update_video_model_progress(
+                            db, job.video_model_id, ProcessingStage.PREPARING, 8
+                        )
+                        upload_success = await s3_service.upload_file(
+                            video_path, video_model.source_video_key
+                        )
+                        if upload_success:
+                            logger.info(f"Auto-recovered S3 upload: {video_model.source_video_key}")
+                        else:
+                            logger.warning(f"Failed to auto-recover S3 upload, continuing with local file")
+
                 # Update progress: preparation done, ready for training
                 await update_video_model_progress(
                     db, job.video_model_id, ProcessingStage.PREPARING, 18
