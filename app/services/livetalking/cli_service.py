@@ -212,10 +212,11 @@ class LiveTalkingCLIService:
             "--img_size", str(img_size),
             "--pads", *pads.split(),
             "--face_det_batch_size", str(face_det_batch_size),
-            "--max_frames", str(max_frames),
+            # NOTE: --max_frames not supported by current LiveTalking version
+            # TODO: Add back when LiveTalking is updated with max_frames support
         ]
 
-        logger.info(f"Generating avatar with max_frames={max_frames} (silent={silent})")
+        logger.info(f"Generating avatar for {avatar_id} (max_frames={max_frames} reserved for future use)")
 
         # Execute command
         return_code, stdout, stderr = await self._run_cli_command(
