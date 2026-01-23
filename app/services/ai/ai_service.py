@@ -249,14 +249,20 @@ class AIService:
         self,
         model_id: UUID,
         db: AsyncSession,
+        local_audio_path: str | None = None,
     ) -> None:
         """Process a voice model using Fish Audio voice cloning.
 
         Steps:
-        1. Download source audio from S3
+        1. Download source audio from S3 (or use local file if provided)
         2. Trim to 60 seconds if longer
         3. Send to Fish Audio API for voice cloning
         4. Store the Fish Audio model ID for TTS generation
+
+        Args:
+            model_id: Voice model ID to process
+            db: Database session
+            local_audio_path: Optional path to local audio file (skips S3 download)
         """
         logger.info(f"Starting voice model processing: {model_id}")
 
@@ -282,8 +288,8 @@ class AIService:
             return
 
         try:
-            # Process training audio: download, trim if needed, re-upload
-            await self._process_training_audio(model, db)
+            # Process training audio: download (or use local file), trim if needed, re-upload
+            await self._process_training_audio(model, db, local_audio_path=local_audio_path)
 
             # Get presigned URL for the (possibly trimmed) source audio
             if not model.source_audio_key:
@@ -325,29 +331,41 @@ class AIService:
         self,
         model: VoiceModel,
         db: AsyncSession,
+        local_audio_path: str | None = None,
     ) -> None:
         """
-        Download, trim (if needed), and re-upload training audio.
+        Download (or use local file), trim (if needed), and re-upload training audio.
 
         Training audio is trimmed to a maximum of 60 seconds.
+
+        Args:
+            model: Voice model to process
+            db: Database session
+            local_audio_path: Optional path to local audio file (skips S3 download)
         """
-        if not model.source_audio_key:
-            logger.warning(f"No source audio key for model {model.id}")
+        if not model.source_audio_key and not local_audio_path:
+            logger.warning(f"No source audio key or local path for model {model.id}")
             return
 
         # Create temp directory for processing
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Determine file extension from s3 key
-            ext = os.path.splitext(model.source_audio_key)[1] or ".wav"
-            input_path = os.path.join(temp_dir, f"input{ext}")
+            # Determine file extension from s3 key or local path
+            source_path = local_audio_path or model.source_audio_key
+            ext = os.path.splitext(source_path)[1] or ".wav"
             output_path = os.path.join(temp_dir, f"output{ext}")
 
-            # Download audio from S3
-            logger.info(f"Downloading audio from S3: {model.source_audio_key}")
-            success = await s3_service.download_file(model.source_audio_key, input_path)
+            # Use local file if provided, otherwise download from S3
+            if local_audio_path and os.path.exists(local_audio_path):
+                input_path = local_audio_path
+                logger.info(f"Using local audio file: {local_audio_path}")
+            else:
+                input_path = os.path.join(temp_dir, f"input{ext}")
+                # Download audio from S3
+                logger.info(f"Downloading audio from S3: {model.source_audio_key}")
+                success = await s3_service.download_file(model.source_audio_key, input_path)
 
-            if not success:
-                raise ValueError(f"Failed to download audio from S3: {model.source_audio_key}")
+                if not success:
+                    raise ValueError(f"Failed to download audio from S3: {model.source_audio_key}")
 
             # Process (trim if needed)
             try:

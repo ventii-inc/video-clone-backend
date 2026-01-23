@@ -326,9 +326,9 @@ async def process_direct_voice_upload_task(
             logger.error(f"Voice S3 upload error: {e}")
 
     async def process_voice():
-        """Process voice model (trim + Fish Audio cloning)."""
+        """Process voice model (trim + Fish Audio cloning) using local file."""
         async with get_db_session() as db:
-            await ai_service.process_voice_model(model_id, db)
+            await ai_service.process_voice_model(model_id, db, local_audio_path=local_path)
 
     # Run S3 upload and voice processing in parallel
     try:
