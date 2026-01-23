@@ -56,8 +56,16 @@ async def list_video_models(
     total_start = time.perf_counter()
     timings = {}
 
-    # Build query
-    query = select(VideoModel).where(VideoModel.user_id == user.id)
+    # Build query - only show processing, completed, and failed statuses
+    VISIBLE_STATUSES = [
+        ModelStatus.PROCESSING.value,
+        ModelStatus.COMPLETED.value,
+        ModelStatus.FAILED.value,
+    ]
+    query = select(VideoModel).where(
+        VideoModel.user_id == user.id,
+        VideoModel.status.in_(VISIBLE_STATUSES)
+    )
 
     if status:
         query = query.where(VideoModel.status == status)
