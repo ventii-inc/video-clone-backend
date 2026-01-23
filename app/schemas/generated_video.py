@@ -88,8 +88,8 @@ class GeneratedVideoListItem(BaseModel):
     duration_seconds: int | None
     resolution: Resolution
     status: GenerationStatus
-    video_model_id: UUID | None
-    voice_model_id: UUID | None
+    video_model_id: UUID | None = None
+    voice_model_id: UUID | None = None
     created_at: datetime
 
     class Config:
