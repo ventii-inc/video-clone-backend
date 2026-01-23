@@ -55,8 +55,25 @@ case "$1" in
 
         echo "=== Upgrade complete ==="
         ;;
+    update)
+        echo "=== Updating server (no DB migration) ==="
+
+        # Pull latest code
+        echo "Pulling latest code..."
+        git pull || { echo "Git pull failed"; exit 1; }
+
+        # Sync dependencies
+        echo "Syncing dependencies..."
+        uv sync || { echo "uv sync failed"; exit 1; }
+
+        # Restart server
+        echo "Restarting server..."
+        $0 restart
+
+        echo "=== Update complete ==="
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|upgrade|logs|status}"
+        echo "Usage: $0 {start|stop|restart|upgrade|update|logs|status}"
         echo "Environment: ENV=${ENV} (override with ENV=local $0 start)"
         exit 1
         ;;
