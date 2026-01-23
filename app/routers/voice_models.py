@@ -125,16 +125,17 @@ async def create_voice_model(
     """
     Create a new voice model and get presigned upload URL.
     """
-    # Check model creation limit
-    count_result = await db.execute(
-        select(func.count()).where(VoiceModel.user_id == user.id)
-    )
-    current_count = count_result.scalar()
-    if current_count >= MAX_VOICE_MODELS_PER_USER:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+    # Check model creation limit (bypass if user has flag set)
+    if not user.bypass_model_limit:
+        count_result = await db.execute(
+            select(func.count()).where(VoiceModel.user_id == user.id)
         )
+        current_count = count_result.scalar()
+        if current_count >= MAX_VOICE_MODELS_PER_USER:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+            )
 
     # Validate content type
     if data.content_type not in ALLOWED_AUDIO_TYPES:
@@ -210,16 +211,17 @@ async def direct_upload_voice(
        - Upload audio to S3
        - Process voice (trim + Fish Audio cloning)
     """
-    # Check model creation limit
-    count_result = await db.execute(
-        select(func.count()).where(VoiceModel.user_id == user.id)
-    )
-    current_count = count_result.scalar()
-    if current_count >= MAX_VOICE_MODELS_PER_USER:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+    # Check model creation limit (bypass if user has flag set)
+    if not user.bypass_model_limit:
+        count_result = await db.execute(
+            select(func.count()).where(VoiceModel.user_id == user.id)
         )
+        current_count = count_result.scalar()
+        if current_count >= MAX_VOICE_MODELS_PER_USER:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+            )
 
     # Validate content type
     if file.content_type not in ALLOWED_AUDIO_TYPES:

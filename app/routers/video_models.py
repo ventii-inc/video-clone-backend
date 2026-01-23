@@ -12,7 +12,7 @@ from sqlalchemy import select, func
 
 from app.db import get_db
 from app.models import User, VideoModel
-from app.models.video_model import ModelStatus
+from app.models.video_model import ModelStatus, ProcessingStage
 from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.ai import ai_service
@@ -162,16 +162,17 @@ async def create_video_model(
     4. Client uploads directly to S3
     5. Client calls /upload-complete when done
     """
-    # Check model creation limit
-    count_result = await db.execute(
-        select(func.count()).where(VideoModel.user_id == user.id)
-    )
-    current_count = count_result.scalar()
-    if current_count >= MAX_VIDEO_MODELS_PER_USER:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+    # Check model creation limit (bypass if user has flag set)
+    if not user.bypass_model_limit:
+        count_result = await db.execute(
+            select(func.count()).where(VideoModel.user_id == user.id)
         )
+        current_count = count_result.scalar()
+        if current_count >= MAX_VIDEO_MODELS_PER_USER:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+            )
 
     # Validate content type
     if data.content_type not in ALLOWED_VIDEO_TYPES:
@@ -245,16 +246,17 @@ async def direct_upload_video(
        - Upload video to S3
        - Generate avatar (which uploads to S3 when complete)
     """
-    # Check model creation limit
-    count_result = await db.execute(
-        select(func.count()).where(VideoModel.user_id == user.id)
-    )
-    current_count = count_result.scalar()
-    if current_count >= MAX_VIDEO_MODELS_PER_USER:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+    # Check model creation limit (bypass if user has flag set)
+    if not user.bypass_model_limit:
+        count_result = await db.execute(
+            select(func.count()).where(VideoModel.user_id == user.id)
         )
+        current_count = count_result.scalar()
+        if current_count >= MAX_VIDEO_MODELS_PER_USER:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+            )
 
     # Validate content type
     if file.content_type not in ALLOWED_VIDEO_TYPES:
@@ -274,13 +276,15 @@ async def direct_upload_video(
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB",
         )
 
-    # Create model record
+    # Create model record with initial progress
     model = VideoModel(
         user_id=user.id,
         name=name,
         file_size_bytes=file_size,
         duration_seconds=duration_seconds,
         status=ModelStatus.UPLOADING.value,
+        progress_percent=5,  # 5% - File received, starting processing
+        processing_stage=ProcessingStage.UPLOADING.value,
     )
     db.add(model)
     await db.commit()
@@ -488,9 +492,11 @@ async def complete_upload(
                 logger.warning(f"Error saving local video copy: {e}")
                 # Continue without local copy - CLI will download from S3 as fallback
 
-    # Update model
+    # Update model with progress
     model.duration_seconds = data.duration_seconds
     model.status = ModelStatus.UPLOADING.value
+    model.progress_percent = 8  # 8% - Upload verified, queuing for processing
+    model.processing_stage = ProcessingStage.UPLOADING.value
     await db.commit()
 
     # Create avatar generation job
@@ -642,9 +648,11 @@ async def avatar_ready(
             detail="Avatar TAR file not found in S3",
         )
 
-    # Update model with avatar data
+    # Update model with avatar data and progress
     model.model_data_key = data.s3_key
     model.status = ModelStatus.COMPLETED.value
+    model.progress_percent = 100
+    model.processing_stage = ProcessingStage.COMPLETED.value
     model.processing_completed_at = datetime.utcnow()
     await db.commit()
 
