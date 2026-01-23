@@ -322,24 +322,6 @@ async def direct_upload_video(
     model.source_video_key = s3_key
     await db.commit()
 
-    # Upload to S3 synchronously (ensures it completes before returning)
-    logger.info(f"Uploading video to S3: {s3_key}")
-    s3_success = await s3_service.upload_file(local_path, s3_key)
-    if not s3_success:
-        # Clean up and fail
-        model.status = ModelStatus.FAILED.value
-        model.processing_stage = ProcessingStage.FAILED.value
-        model.error_message = "Failed to upload video to S3"
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload video to S3",
-        )
-
-    logger.info(f"S3 upload complete: {s3_key}")
-    model.progress_percent = 10  # 10% - S3 upload complete
-    await db.commit()
-
     # Create avatar generation job
     job = await avatar_job_service.create_job(
         video_model_id=model.id,
@@ -348,12 +330,14 @@ async def direct_upload_video(
     )
     logger.info(f"Created avatar job {job.id} for video model {model.id}")
 
-    # Background tasks for non-critical work (thumbnail) and triggering job processing
+    # Background tasks: S3 upload, thumbnail, and trigger avatar processing
+    # These run async - if they fail, recovery script will retry stuck uploads
     background_tasks.add_task(
         process_upload_background_tasks,
         model_id=model.id,
         user_id=user.id,
         local_path=local_path,
+        s3_key=s3_key,
     )
 
     return DirectUploadResponse(
@@ -367,15 +351,34 @@ async def process_upload_background_tasks(
     model_id: UUID,
     user_id: int,
     local_path: str,
+    s3_key: str,
 ):
     """
-    Background task for non-critical post-upload work.
+    Background task to upload video to S3, generate thumbnail, and trigger avatar processing.
 
-    S3 upload is now done synchronously before returning.
-    This handles thumbnail generation and triggers avatar processing.
-    These are non-critical - if they fail, they can be retried.
+    If this task crashes (e.g., server restart), the recovery script will retry
+    stuck uploads by checking for models with status='uploading' and local_video_path set.
     """
     from app.db import get_db_session
+
+    async def upload_to_s3():
+        """Upload the local video file to S3."""
+        try:
+            success = await s3_service.upload_file(local_path, s3_key)
+            if success:
+                logger.info(f"S3 upload complete: {s3_key}")
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VideoModel).where(VideoModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.progress_percent = 10  # S3 upload done
+                        await db.commit()
+            else:
+                logger.error(f"S3 upload failed: {s3_key}")
+        except Exception as e:
+            logger.error(f"S3 upload error for model {model_id}: {e}")
 
     async def generate_and_upload_thumbnail():
         """Extract thumbnail from video and upload to S3."""
@@ -428,9 +431,10 @@ async def process_upload_background_tasks(
         except Exception as e:
             logger.error(f"Avatar processing trigger error for model {model_id}: {e}")
 
-    # Run thumbnail generation and avatar processing in parallel
-    task_names = ["generate_thumbnail", "trigger_avatar_processing"]
+    # Run S3 upload, thumbnail generation, and avatar processing in parallel
+    task_names = ["upload_to_s3", "generate_thumbnail", "trigger_avatar_processing"]
     results = await asyncio.gather(
+        upload_to_s3(),
         generate_and_upload_thumbnail(),
         trigger_avatar_processing(),
         return_exceptions=True,

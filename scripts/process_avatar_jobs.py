@@ -9,6 +9,9 @@ Usage:
     # Check running jobs for completion (poll detached processes)
     ENV=staging uv run python scripts/process_avatar_jobs.py --check-running
 
+    # Recover stuck uploads (retry S3 upload)
+    ENV=staging uv run python scripts/process_avatar_jobs.py --recover-uploads
+
     # Reset failed jobs and process all
     ENV=staging uv run python scripts/process_avatar_jobs.py --reset-failed
 
@@ -186,6 +189,97 @@ async def check_running_jobs():
         return finalized
 
 
+async def recover_stuck_uploads():
+    """
+    Recover uploads that got stuck (e.g., due to server restart).
+
+    Finds video models with status='uploading' that have a local file but no S3 file,
+    and retries the S3 upload.
+    """
+    import os
+    from datetime import datetime, timedelta
+    from sqlalchemy import text
+
+    from app.db import get_db_session
+    from app.services.s3 import s3_service
+
+    async with get_db_session() as db:
+        # Find stuck uploads (uploading for more than 5 minutes)
+        cutoff = datetime.utcnow() - timedelta(minutes=5)
+        result = await db.execute(text('''
+            SELECT id, name, local_video_path, source_video_key, user_id
+            FROM video_models
+            WHERE status = 'uploading'
+            AND updated_at < :cutoff
+            AND local_video_path IS NOT NULL
+        '''), {'cutoff': cutoff})
+
+        stuck = result.fetchall()
+        if not stuck:
+            print("No stuck uploads found")
+            return 0
+
+        print(f"Found {len(stuck)} stuck upload(s)")
+        recovered = 0
+
+        for row in stuck:
+            model_id, name, local_path, s3_key, user_id = row
+            print(f"  Recovering: {name} ({model_id})")
+
+            # Check if local file exists
+            if not local_path or not os.path.exists(local_path):
+                print(f"    Local file missing, marking as failed")
+                await db.execute(text('''
+                    UPDATE video_models
+                    SET status = 'failed', processing_stage = 'failed',
+                        error_message = 'Local video file not found'
+                    WHERE id = :id
+                '''), {'id': str(model_id)})
+                await db.commit()
+                continue
+
+            # Check if already on S3
+            exists = await s3_service.file_exists(s3_key)
+            if exists:
+                print(f"    Already on S3, updating status")
+                await db.execute(text('''
+                    UPDATE video_models
+                    SET status = 'pending', processing_stage = 'pending',
+                        progress_percent = 10
+                    WHERE id = :id
+                '''), {'id': str(model_id)})
+                await db.commit()
+                recovered += 1
+                continue
+
+            # Upload to S3
+            print(f"    Uploading to S3: {s3_key}")
+            success = await s3_service.upload_file(local_path, s3_key)
+
+            if success:
+                print(f"    Upload successful")
+                await db.execute(text('''
+                    UPDATE video_models
+                    SET status = 'pending', processing_stage = 'pending',
+                        progress_percent = 10
+                    WHERE id = :id
+                '''), {'id': str(model_id)})
+                await db.commit()
+                recovered += 1
+            else:
+                print(f"    Upload failed")
+                await db.execute(text('''
+                    UPDATE video_models
+                    SET status = 'failed', processing_stage = 'failed',
+                        error_message = 'S3 upload failed during recovery'
+                    WHERE id = :id
+                '''), {'id': str(model_id)})
+                await db.commit()
+
+        print(f"Recovered {recovered} upload(s)")
+        return recovered
+
+
 async def run_daemon(interval: int):
     """
     Run as a daemon that periodically checks running jobs.
@@ -264,6 +358,11 @@ async def main():
         help="Check running jobs for completion (poll detached processes)",
     )
     parser.add_argument(
+        "--recover-uploads",
+        action="store_true",
+        help="Recover stuck uploads (retry S3 upload for stuck 'uploading' models)",
+    )
+    parser.add_argument(
         "--daemon",
         action="store_true",
         help="Run as a daemon that periodically checks running jobs",
@@ -287,6 +386,14 @@ async def main():
     # Daemon mode
     if args.daemon:
         await run_daemon(args.interval)
+        return
+
+    # Recover stuck uploads
+    if args.recover_uploads:
+        print("\nRecovering stuck uploads...")
+        await recover_stuck_uploads()
+        print("\nFinal status:")
+        await show_status()
         return
 
     # Check running jobs
