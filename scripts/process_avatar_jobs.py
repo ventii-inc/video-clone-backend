@@ -6,6 +6,9 @@ Usage:
     # Process all pending jobs
     ENV=staging uv run python scripts/process_avatar_jobs.py
 
+    # Check running jobs for completion (poll detached processes)
+    ENV=staging uv run python scripts/process_avatar_jobs.py --check-running
+
     # Reset failed jobs and process all
     ENV=staging uv run python scripts/process_avatar_jobs.py --reset-failed
 
@@ -14,6 +17,9 @@ Usage:
 
     # Reset and process a specific job by ID
     ENV=staging uv run python scripts/process_avatar_jobs.py --job-id <uuid>
+
+    # Run as a daemon that periodically checks running jobs
+    ENV=staging uv run python scripts/process_avatar_jobs.py --daemon --interval 30
 """
 
 import argparse
@@ -37,8 +43,13 @@ print(f"Environment: {env}")
 
 async def show_status():
     """Show current job queue status."""
+    from sqlalchemy import select
+
     from app.db import get_db_session
+    from app.models import AvatarJob
+    from app.models.avatar_job import JobStatus
     from app.services.avatar_job import avatar_job_service
+    from app.services.livetalking import livetalking_cli_service
 
     async with get_db_session() as db:
         running = await avatar_job_service.get_running_count(db)
@@ -54,6 +65,24 @@ async def show_status():
         print(f"Completed Today: {completed}")
         print(f"Failed Today:    {failed}")
         print("=" * 40)
+
+        # Show details of running jobs with PIDs
+        if running > 0:
+            result = await db.execute(
+                select(AvatarJob).where(
+                    AvatarJob.status == JobStatus.PROCESSING.value,
+                    AvatarJob.pid.isnot(None),
+                )
+            )
+            running_jobs = result.scalars().all()
+            if running_jobs:
+                print("\nRunning Jobs (detached processes):")
+                print("-" * 60)
+                for job in running_jobs:
+                    is_running = livetalking_cli_service.is_process_running(job.pid)
+                    status_str = "alive" if is_running else "finished"
+                    print(f"  Job {job.id}: PID={job.pid} ({status_str})")
+                print("-" * 60)
 
         return pending
 
@@ -89,6 +118,8 @@ async def reset_failed_jobs():
                 error_message=None,
                 started_at=None,
                 completed_at=None,
+                pid=None,
+                output_file=None,
             )
         )
 
@@ -144,6 +175,68 @@ async def process_pending_jobs():
         return started
 
 
+async def check_running_jobs():
+    """Check running jobs for completion (poll detached processes)."""
+    from app.db import get_db_session
+    from app.services.avatar_job import avatar_job_service
+
+    async with get_db_session() as db:
+        finalized = await avatar_job_service.check_running_jobs(db)
+        print(f"Finalized {finalized} job(s)")
+        return finalized
+
+
+async def run_daemon(interval: int):
+    """
+    Run as a daemon that periodically checks running jobs.
+
+    Args:
+        interval: Seconds between checks
+    """
+    import signal
+    import sys
+
+    print(f"Starting daemon mode, checking every {interval} seconds...")
+    print("Press Ctrl+C to stop")
+
+    running = True
+
+    def signal_handler(signum, frame):
+        nonlocal running
+        print("\nShutting down...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    while running:
+        try:
+            # Check running jobs
+            finalized = await check_running_jobs()
+
+            # Show brief status
+            from app.db import get_db_session
+            from app.services.avatar_job import avatar_job_service
+
+            async with get_db_session() as db:
+                running_count = await avatar_job_service.get_running_count(db)
+                pending_count = await avatar_job_service.get_pending_count(db)
+
+            print(
+                f"[{asyncio.get_event_loop().time():.0f}] "
+                f"Finalized: {finalized}, Running: {running_count}, Pending: {pending_count}"
+            )
+
+            # Sleep for interval
+            await asyncio.sleep(interval)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Error in daemon loop: {e}")
+            await asyncio.sleep(interval)
+
+
 async def main():
     parser = argparse.ArgumentParser(
         description="Process pending avatar generation jobs",
@@ -165,6 +258,22 @@ async def main():
         type=str,
         help="Reset and process a specific job by ID",
     )
+    parser.add_argument(
+        "--check-running",
+        action="store_true",
+        help="Check running jobs for completion (poll detached processes)",
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run as a daemon that periodically checks running jobs",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=30,
+        help="Interval in seconds between checks in daemon mode (default: 30)",
+    )
 
     args = parser.parse_args()
 
@@ -173,6 +282,19 @@ async def main():
 
     if args.status:
         # Status only, don't process
+        return
+
+    # Daemon mode
+    if args.daemon:
+        await run_daemon(args.interval)
+        return
+
+    # Check running jobs
+    if args.check_running:
+        print("\nChecking running jobs for completion...")
+        await check_running_jobs()
+        print("\nFinal status:")
+        await show_status()
         return
 
     # Reset specific job if requested

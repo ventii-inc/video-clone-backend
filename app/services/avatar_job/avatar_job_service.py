@@ -1,8 +1,12 @@
 """Avatar job service for managing the avatar generation queue"""
 
+import glob
 import os
+import shutil
+import tarfile
 import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List, Optional
 from uuid import UUID
 
@@ -20,6 +24,9 @@ from app.services.email import TrainingCompletionData, get_email_service
 from app.services.progress import update_video_model_progress
 from app.services.s3 import s3_service
 from app.utils import logger
+
+# Directory for job output files
+AVATAR_JOBS_OUTPUT_DIR = "/tmp/avatar_jobs"
 
 
 class AvatarJobService:
@@ -252,14 +259,14 @@ class AvatarJobService:
         self, job: AvatarJob, video_model: VideoModel, db: AsyncSession
     ) -> bool:
         """
-        Trigger avatar generation via CLI (local subprocess).
+        Trigger avatar generation via CLI as a detached subprocess.
+
+        The subprocess runs independently of the parent server, so it survives
+        server restarts. We store the PID and output file path for tracking.
 
         Uses local video file if available, otherwise downloads from S3.
-        Runs genavatar.py, uploads result to S3.
+        Returns immediately after spawning the process (fire-and-forget).
         """
-        temp_video_path = None
-        use_temp_file = False
-
         try:
             # Check if local video file exists
             if video_model.local_video_path and os.path.exists(video_model.local_video_path):
@@ -270,7 +277,8 @@ class AvatarJobService:
                     db, job.video_model_id, ProcessingStage.PREPARING, 18
                 )
             else:
-                # Fallback: Download video from S3 to temp file
+                # Fallback: Download video from S3 to a persistent temp location
+                # We can't use NamedTemporaryFile with delete=True since we return immediately
                 logger.info(f"Local video not found, downloading from S3: {video_model.source_video_key}")
 
                 # Update progress: downloading
@@ -279,18 +287,16 @@ class AvatarJobService:
                 )
 
                 ext = os.path.splitext(video_model.source_video_key)[1] or ".mp4"
-                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                    temp_video_path = tmp.name
+                # Store in job output directory so it persists
+                Path(AVATAR_JOBS_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+                video_path = os.path.join(AVATAR_JOBS_OUTPUT_DIR, f"{job.id}_source{ext}")
 
                 success = await s3_service.download_file(
-                    video_model.source_video_key, temp_video_path
+                    video_model.source_video_key, video_path
                 )
 
                 if not success:
                     raise ValueError(f"Failed to download video from S3")
-
-                video_path = temp_video_path
-                use_temp_file = True
 
                 # Update progress: download complete
                 await update_video_model_progress(
@@ -302,39 +308,35 @@ class AvatarJobService:
                 db, job.video_model_id, ProcessingStage.TRAINING, 20
             )
 
-            # Run avatar generation via CLI
-            logger.info(f"Starting CLI avatar generation for {job.video_model_id}")
-            result = await livetalking_cli_service.generate_avatar(
+            # Prepare output file path
+            Path(AVATAR_JOBS_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+            output_file = os.path.join(AVATAR_JOBS_OUTPUT_DIR, f"{job.id}.log")
+
+            # Start avatar generation as detached process
+            logger.info(f"Starting detached CLI avatar generation for {job.video_model_id}")
+            pid = livetalking_cli_service.start_avatar_generation_detached(
                 video_path=video_path,
                 avatar_id=str(job.video_model_id),
-                user_id=job.user_id,
+                output_file=output_file,
                 img_size=256,  # wav2lip256
-                upload_to_s3=True,
             )
 
-            if result.success:
-                # Update progress: training complete, finalizing
-                await update_video_model_progress(
-                    db, job.video_model_id, ProcessingStage.FINALIZING, 85
-                )
-                # Job completed successfully
-                await self.mark_completed(
-                    job.id,
-                    avatar_s3_key=result.s3_key or f"avatars/{job.user_id}/{job.video_model_id}.tar",
-                    db=db,
-                    execution_mode="cli",
-                )
-                logger.info(
-                    f"CLI avatar generation completed: {job.video_model_id}, "
-                    f"frames={result.frame_count}, s3_key={result.s3_key}"
-                )
-                return True
-            else:
-                raise ValueError(result.error or "Unknown CLI error")
+            # Store PID and output file for tracking
+            job.pid = pid
+            job.output_file = output_file
+            await db.commit()
+
+            logger.info(
+                f"Detached avatar generation started: job={job.id}, pid={pid}, "
+                f"output_file={output_file}"
+            )
+
+            # Return immediately - job will be checked later via check_running_jobs()
+            return True
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"CLI avatar generation failed for {job.id}: {error_msg}")
+            logger.error(f"CLI avatar generation failed to start for {job.id}: {error_msg}")
 
             # Check if we should retry
             if job.attempts < job.max_attempts:
@@ -353,10 +355,6 @@ class AvatarJobService:
                     db,
                 )
                 return False
-        finally:
-            # Clean up temp file only if we created one
-            if use_temp_file and temp_video_path and os.path.exists(temp_video_path):
-                os.remove(temp_video_path)
 
     async def _trigger_job_api(
         self, job: AvatarJob, video_model: VideoModel, db: AsyncSession
@@ -418,6 +416,174 @@ class AvatarJobService:
                 )
                 return False
 
+    async def check_running_jobs(self, db: AsyncSession) -> int:
+        """
+        Check all running CLI jobs for completion.
+
+        This method polls detached processes to see if they've finished,
+        then finalizes completed jobs (upload to S3, send notifications).
+
+        Should be called periodically (e.g., every 30 seconds) via cron or background task.
+
+        Returns:
+            Number of jobs that were finalized
+        """
+        # Get all processing jobs with a PID (detached CLI jobs)
+        result = await db.execute(
+            select(AvatarJob).where(
+                AvatarJob.status == JobStatus.PROCESSING.value,
+                AvatarJob.pid.isnot(None),
+            )
+        )
+        running_jobs = list(result.scalars().all())
+
+        if not running_jobs:
+            return 0
+
+        jobs_finalized = 0
+
+        for job in running_jobs:
+            try:
+                is_complete, result_data, error_msg = livetalking_cli_service.check_avatar_generation_result(
+                    pid=job.pid,
+                    output_file=job.output_file,
+                    avatar_id=str(job.video_model_id),
+                )
+
+                if not is_complete:
+                    # Still running
+                    continue
+
+                if result_data and result_data.get("success"):
+                    # Success - finalize the job
+                    await self._finalize_completed_job(job, result_data, db)
+                    jobs_finalized += 1
+                else:
+                    # Failed
+                    if job.attempts < job.max_attempts:
+                        # Reset for retry
+                        job.status = JobStatus.PENDING.value
+                        job.error_message = f"Attempt {job.attempts} failed: {error_msg}"
+                        job.pid = None
+                        job.output_file = None
+                        await db.commit()
+                        logger.warning(
+                            f"Job {job.id} failed, will retry. "
+                            f"Attempts: {job.attempts}/{job.max_attempts}"
+                        )
+                    else:
+                        await self.mark_failed(
+                            job.id,
+                            f"Max attempts reached. Last error: {error_msg}",
+                            db,
+                        )
+                    jobs_finalized += 1
+
+            except Exception as e:
+                logger.error(f"Error checking job {job.id}: {e}")
+
+        if jobs_finalized > 0:
+            logger.info(f"Finalized {jobs_finalized} avatar generation jobs")
+            # Try to process pending jobs now that slots may be available
+            await self.process_pending_jobs(db)
+
+        return jobs_finalized
+
+    async def _finalize_completed_job(
+        self,
+        job: AvatarJob,
+        result_data: dict,
+        db: AsyncSession,
+    ) -> None:
+        """
+        Finalize a completed detached job: move avatar, upload to S3, mark complete.
+
+        Args:
+            job: The completed job
+            result_data: Result data from the CLI process
+            db: Database session
+        """
+        avatar_id = str(job.video_model_id)
+        settings = LiveTalkingSettings()
+
+        # Get the avatar path
+        livetalking_avatar_path = os.path.join(
+            settings.LIVETALKING_ROOT, "data", "avatars", avatar_id
+        )
+        local_avatar_dir = os.path.join(settings.AVATAR_LOCAL_PATH, avatar_id)
+
+        # Move avatar from LiveTalking's location to our avatar storage if needed
+        livetalking_resolved = os.path.realpath(livetalking_avatar_path)
+        local_resolved = os.path.realpath(local_avatar_dir)
+
+        if livetalking_resolved != local_resolved:
+            if os.path.exists(livetalking_avatar_path):
+                if os.path.exists(local_avatar_dir):
+                    shutil.rmtree(local_avatar_dir)
+                shutil.move(livetalking_avatar_path, local_avatar_dir)
+                logger.info(f"Moved avatar to {local_avatar_dir}")
+        else:
+            # Same path - use whatever exists
+            if os.path.exists(livetalking_avatar_path):
+                local_avatar_dir = livetalking_avatar_path
+
+        # Upload to S3
+        s3_key = None
+        tar_path = None
+        try:
+            tar_path = f"{local_avatar_dir}.tar"
+            with tarfile.open(tar_path, "w") as tar:
+                tar.add(local_avatar_dir, arcname=avatar_id)
+
+            s3_key = f"avatars/{job.user_id}/{avatar_id}.tar"
+            await s3_service.upload_file(
+                tar_path,
+                s3_key,
+                content_type="application/x-tar",
+            )
+            logger.info(f"Uploaded avatar TAR to S3: {s3_key}")
+        except Exception as e:
+            logger.error(f"Failed to upload avatar to S3: {e}")
+            s3_key = f"avatars/{job.user_id}/{avatar_id}.tar"  # Still set expected key
+        finally:
+            if tar_path and os.path.exists(tar_path):
+                os.remove(tar_path)
+
+        # Update progress before marking complete
+        await update_video_model_progress(
+            db, job.video_model_id, ProcessingStage.FINALIZING, 85
+        )
+
+        # Clean up temp files
+        self._cleanup_job_files(job)
+
+        # Mark the job as completed
+        await self.mark_completed(
+            job.id,
+            avatar_s3_key=s3_key,
+            db=db,
+            execution_mode="cli",
+        )
+
+        logger.info(
+            f"CLI avatar generation completed: {job.video_model_id}, "
+            f"frames={result_data.get('frame_count')}, s3_key={s3_key}"
+        )
+
+    def _cleanup_job_files(self, job: AvatarJob) -> None:
+        """Clean up temporary files for a job."""
+        try:
+            # Remove output log file
+            if job.output_file and os.path.exists(job.output_file):
+                os.remove(job.output_file)
+
+            # Remove downloaded source video if it was in our temp directory
+            source_pattern = os.path.join(AVATAR_JOBS_OUTPUT_DIR, f"{job.id}_source*")
+            for f in glob.glob(source_pattern):
+                os.remove(f)
+        except Exception as e:
+            logger.warning(f"Error cleaning up job files for {job.id}: {e}")
+
     async def mark_completed(
         self,
         job_id: UUID,
@@ -439,6 +605,8 @@ class AvatarJobService:
         job.completed_at = datetime.utcnow()
         job.avatar_s3_key = avatar_s3_key
         job.error_message = None
+        job.pid = None  # Clear detached process tracking
+        job.output_file = None
         if runpod_job_id:
             job.runpod_job_id = runpod_job_id
 
@@ -502,6 +670,8 @@ class AvatarJobService:
         job.status = JobStatus.FAILED.value
         job.completed_at = datetime.utcnow()
         job.error_message = error_message
+        job.pid = None  # Clear detached process tracking
+        job.output_file = None
 
         # Update video model
         vm_result = await db.execute(

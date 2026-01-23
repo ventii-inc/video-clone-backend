@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import shutil
+import signal
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.s3 import s3_service
+from app.services.video import get_video_duration
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +160,190 @@ class LiveTalkingCLIService:
         except Exception as e:
             logger.error(f"Command execution failed: {e}")
             return -1, "", str(e)
+
+    def _run_cli_command_detached(
+        self,
+        command: list[str],
+        output_file: str,
+        cwd: Optional[str] = None,
+    ) -> int:
+        """
+        Run command as a detached process that survives parent termination.
+
+        The process writes stdout/stderr to output_file and continues running
+        even if the parent process (FastAPI server) is killed.
+
+        Args:
+            command: Command and arguments to run
+            output_file: Path to file for stdout/stderr output
+            cwd: Working directory (defaults to livetalking_root)
+
+        Returns:
+            PID of the spawned process
+        """
+        work_dir = cwd or self.livetalking_root
+
+        # Set up environment with PYTHONPATH for LiveTalking modules
+        env = os.environ.copy()
+        wav2lip_path = os.path.join(self.livetalking_root, "wav2lip")
+        pythonpath = f"{self.livetalking_root}:{wav2lip_path}"
+        if "PYTHONPATH" in env:
+            pythonpath = f"{pythonpath}:{env['PYTHONPATH']}"
+        env["PYTHONPATH"] = pythonpath
+
+        # Replace "python" with the venv's Python path
+        venv_python = self._get_venv_python()
+        modified_command = command.copy()
+        if modified_command[0] == "python":
+            modified_command[0] = venv_python
+
+        logger.info(f"Running detached CLI command: {' '.join(modified_command)}")
+        logger.info(f"Output file: {output_file}")
+        logger.info(f"Working directory: {work_dir}")
+
+        # Ensure output directory exists
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+
+        # Open output file for writing
+        with open(output_file, 'w') as outfile:
+            # Start the process fully detached:
+            # - start_new_session=True creates new process group (won't receive parent's signals)
+            # - stdout/stderr go to file instead of being captured
+            # - We don't wait for completion
+            process = subprocess.Popen(
+                modified_command,
+                stdout=outfile,
+                stderr=subprocess.STDOUT,
+                cwd=work_dir,
+                env=env,
+                start_new_session=True,  # Detach from parent process group
+            )
+
+        logger.info(f"Started detached process with PID: {process.pid}")
+        return process.pid
+
+    def is_process_running(self, pid: int) -> bool:
+        """
+        Check if a process with the given PID is still running.
+
+        Args:
+            pid: Process ID to check
+
+        Returns:
+            True if process is running, False otherwise
+        """
+        if pid is None:
+            return False
+        try:
+            # Send signal 0 to check if process exists
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def read_process_output(self, output_file: str) -> Optional[dict]:
+        """
+        Read and parse JSON output from process output file.
+
+        The genavatar.py script outputs JSON lines. This method reads the file
+        and returns the parsed JSON result if found.
+
+        Args:
+            output_file: Path to the output file
+
+        Returns:
+            Parsed JSON dict if successful result found, None otherwise
+        """
+        if not output_file or not os.path.exists(output_file):
+            return None
+
+        try:
+            with open(output_file, 'r') as f:
+                content = f.read()
+
+            # Look for JSON output in the file
+            for line in content.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        data = json.loads(line)
+                        # Return if it looks like a result (has avatar_id or success field)
+                        if "avatar_id" in data or "success" in data:
+                            return data
+                    except json.JSONDecodeError:
+                        continue
+
+            return None
+        except Exception as e:
+            logger.error(f"Error reading process output file {output_file}: {e}")
+            return None
+
+    def check_avatar_generation_result(
+        self,
+        pid: int,
+        output_file: str,
+        avatar_id: str,
+    ) -> tuple[bool, Optional[dict], Optional[str]]:
+        """
+        Check if avatar generation has completed and get the result.
+
+        Args:
+            pid: Process ID to check
+            output_file: Path to output file
+            avatar_id: Avatar ID being generated
+
+        Returns:
+            Tuple of (is_complete, result_data, error_message)
+            - is_complete: True if process finished (success or failure)
+            - result_data: Dict with result info if successful
+            - error_message: Error string if failed
+        """
+        process_running = self.is_process_running(pid)
+
+        if process_running:
+            # Still running
+            return (False, None, None)
+
+        # Process has finished - check results
+        output_data = self.read_process_output(output_file)
+
+        # Check if avatar directory was created (indicates success)
+        livetalking_avatar_path = os.path.join(
+            self.livetalking_root, "data", "avatars", avatar_id
+        )
+        local_avatar_dir = self._get_avatar_local_dir(avatar_id)
+
+        avatar_exists = os.path.exists(livetalking_avatar_path) or os.path.exists(local_avatar_dir)
+
+        if avatar_exists:
+            # Count frames to verify generation worked
+            frame_count = 0
+            check_path = local_avatar_dir if os.path.exists(local_avatar_dir) else livetalking_avatar_path
+            face_imgs_dir = os.path.join(check_path, "face_imgs")
+            if os.path.exists(face_imgs_dir):
+                frame_count = len([f for f in os.listdir(face_imgs_dir) if f.endswith(".png")])
+
+            if frame_count > 0:
+                return (True, {
+                    "success": True,
+                    "avatar_id": avatar_id,
+                    "frame_count": frame_count,
+                    "avatar_path": check_path,
+                }, None)
+
+        # Process finished but no valid avatar found - read error from output
+        error_msg = "Avatar generation failed - no frames generated"
+        if output_file and os.path.exists(output_file):
+            try:
+                with open(output_file, 'r') as f:
+                    content = f.read()
+                    # Get last 500 chars as error context
+                    if content:
+                        error_msg = content[-500:] if len(content) > 500 else content
+            except Exception:
+                pass
+
+        return (True, None, error_msg)
 
     def _ensure_avatar_directory(self) -> None:
         """Ensure local avatar directory exists."""
@@ -310,6 +497,59 @@ class LiveTalkingCLIService:
 
         return result
 
+    def start_avatar_generation_detached(
+        self,
+        video_path: str,
+        avatar_id: str,
+        output_file: str,
+        img_size: int = 256,
+        pads: str = "0 10 0 0",
+        face_det_batch_size: int = 16,
+        max_frames: int = MAX_FRAMES_DEFAULT,
+        silent: bool = False,
+    ) -> int:
+        """
+        Start avatar generation as a detached process.
+
+        This method returns immediately after spawning the process.
+        The process continues running even if the parent server is restarted.
+
+        Args:
+            video_path: Path to source video file (local)
+            avatar_id: Unique identifier for the avatar
+            output_file: Path for stdout/stderr output
+            img_size: Face crop size (96 for wav2lip, 256 for wav2lip256)
+            pads: Padding values "top bottom left right"
+            face_det_batch_size: Batch size for face detection
+            max_frames: Maximum frames to extract (default: 1000)
+            silent: If True, uses reduced frame count (100) for idle avatars
+
+        Returns:
+            PID of the spawned process
+        """
+        # Use reduced frame count for silent/idle avatars
+        if silent:
+            max_frames = MAX_FRAMES_SILENT
+
+        self._ensure_avatar_directory()
+
+        # Build command
+        command = [
+            "python",
+            "wav2lip/genavatar.py",
+            "--avatar_id", avatar_id,
+            "--video_path", video_path,
+            "--img_size", str(img_size),
+            "--pads", *pads.split(),
+            "--face_det_batch_size", str(face_det_batch_size),
+            "--max_frames", str(max_frames),
+        ]
+
+        logger.info(f"Starting detached avatar generation with max_frames={max_frames} (silent={silent})")
+
+        # Execute command in detached mode
+        return self._run_cli_command_detached(command, output_file)
+
     async def _upload_avatar_to_s3(
         self,
         avatar_id: str,
@@ -437,10 +677,19 @@ class LiveTalkingCLIService:
         except json.JSONDecodeError:
             pass
 
+        # Get duration from CLI output or from the actual video file
+        duration = result_data.get("audio_duration")
+        if duration is None:
+            try:
+                duration = await get_video_duration(output_path)
+                logger.info(f"Got video duration from file: {duration}s")
+            except Exception as e:
+                logger.warning(f"Failed to get video duration: {e}")
+
         result = VideoGenerationResult(
             success=True,
             output_path=output_path,
-            duration=result_data.get("audio_duration"),
+            duration=duration,
             inference_time=result_data.get("inference_time"),
             total_time=result_data.get("total_time"),
         )
