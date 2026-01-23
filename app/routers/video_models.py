@@ -322,6 +322,24 @@ async def direct_upload_video(
     model.source_video_key = s3_key
     await db.commit()
 
+    # Upload to S3 synchronously (ensures it completes before returning)
+    logger.info(f"Uploading video to S3: {s3_key}")
+    s3_success = await s3_service.upload_file(local_path, s3_key)
+    if not s3_success:
+        # Clean up and fail
+        model.status = ModelStatus.FAILED.value
+        model.processing_stage = ProcessingStage.FAILED.value
+        model.error_message = "Failed to upload video to S3"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to upload video to S3",
+        )
+
+    logger.info(f"S3 upload complete: {s3_key}")
+    model.progress_percent = 10  # 10% - S3 upload complete
+    await db.commit()
+
     # Create avatar generation job
     job = await avatar_job_service.create_job(
         video_model_id=model.id,
@@ -330,13 +348,12 @@ async def direct_upload_video(
     )
     logger.info(f"Created avatar job {job.id} for video model {model.id}")
 
-    # Trigger parallel S3 upload and avatar generation
+    # Background tasks for non-critical work (thumbnail) and triggering job processing
     background_tasks.add_task(
-        process_direct_upload_task,
+        process_upload_background_tasks,
         model_id=model.id,
         user_id=user.id,
         local_path=local_path,
-        s3_key=s3_key,
     )
 
     return DirectUploadResponse(
@@ -346,36 +363,19 @@ async def direct_upload_video(
     )
 
 
-async def process_direct_upload_task(
+async def process_upload_background_tasks(
     model_id: UUID,
-    user_id: UUID,
+    user_id: int,
     local_path: str,
-    s3_key: str,
 ):
     """
-    Background task to run S3 upload, thumbnail generation, and avatar generation in parallel.
+    Background task for non-critical post-upload work.
+
+    S3 upload is now done synchronously before returning.
+    This handles thumbnail generation and triggers avatar processing.
+    These are non-critical - if they fail, they can be retried.
     """
     from app.db import get_db_session
-
-    async def upload_to_s3():
-        """Upload the local video file to S3."""
-        try:
-            success = await s3_service.upload_file(local_path, s3_key)
-            if success:
-                logger.info(f"S3 upload complete: {s3_key}")
-                # Update model with presigned URL
-                async with get_db_session() as db:
-                    result = await db.execute(
-                        select(VideoModel).where(VideoModel.id == model_id)
-                    )
-                    model = result.scalar_one_or_none()
-                    if model:
-                        model.source_video_url = await s3_service.generate_presigned_url(s3_key)
-                        await db.commit()
-            else:
-                logger.error(f"S3 upload failed: {s3_key}")
-        except Exception as e:
-            logger.error(f"S3 upload error: {e}")
 
     async def generate_and_upload_thumbnail():
         """Extract thumbnail from video and upload to S3."""
@@ -418,19 +418,21 @@ async def process_direct_upload_task(
                 os.remove(thumbnail_path)
 
         except Exception as e:
-            logger.error(f"Thumbnail generation error: {e}")
+            logger.error(f"Thumbnail generation error for model {model_id}: {e}")
 
-    async def generate_avatar():
-        """Process avatar generation."""
-        async with get_db_session() as db:
-            await avatar_job_service.process_pending_jobs(db)
+    async def trigger_avatar_processing():
+        """Trigger avatar generation job processing."""
+        try:
+            async with get_db_session() as db:
+                await avatar_job_service.process_pending_jobs(db)
+        except Exception as e:
+            logger.error(f"Avatar processing trigger error for model {model_id}: {e}")
 
-    # Run S3 upload, thumbnail generation, and avatar generation in parallel
-    task_names = ["upload_to_s3", "generate_thumbnail", "generate_avatar"]
+    # Run thumbnail generation and avatar processing in parallel
+    task_names = ["generate_thumbnail", "trigger_avatar_processing"]
     results = await asyncio.gather(
-        upload_to_s3(),
         generate_and_upload_thumbnail(),
-        generate_avatar(),
+        trigger_avatar_processing(),
         return_exceptions=True,
     )
 
