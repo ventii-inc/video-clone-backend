@@ -1,28 +1,6 @@
 """Email service configuration."""
 
-from enum import Enum
-
 from pydantic_settings import BaseSettings
-
-
-class EmailProvider(str, Enum):
-    """Email provider options."""
-
-    GOOGLE_WORKSPACE = "google_workspace"
-    AWS_SES = "aws_ses"
-
-
-class SMTPSettings(BaseSettings):
-    """Google Workspace SMTP configuration."""
-
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 465
-    SMTP_USER: str = "support@ventii.jp"
-    SMTP_PASSWORD: str = ""
-    SEND_FROM_NAME: str = "Ventii Video Clone"
-
-    class Config:
-        env_prefix = "EMAIL_"
 
 
 class SESSettings(BaseSettings):
@@ -38,5 +16,4 @@ class SESSettings(BaseSettings):
         env_prefix = "EMAIL_"
 
 
-smtp_settings = SMTPSettings()
 ses_settings = SESSettings()

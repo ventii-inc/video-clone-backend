@@ -1,21 +1,12 @@
-"""Email service for sending notifications."""
+"""Email service for sending notifications via AWS SES."""
 
-import re
 from dataclasses import dataclass
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.utils import formataddr
 from typing import Optional
 
 import boto3
-from aiosmtplib import SMTP
 from botocore.exceptions import ClientError
 
-from app.services.email.email_config import (
-    EmailProvider,
-    ses_settings,
-    smtp_settings,
-)
+from app.services.email.email_config import ses_settings
 from app.utils.logger import logger
 
 
@@ -30,106 +21,18 @@ class TrainingCompletionData:
 
 
 class EmailService:
-    """Email service supporting both SMTP and AWS SES."""
+    """Email service using AWS SES."""
 
-    def __init__(self, provider: EmailProvider):
-        """
-        Initialize email service with specified provider.
-
-        Args:
-            provider: Email provider to use (REQUIRED)
-        """
-        self.provider = provider
-        self._ses_client = None
-
-        if self.provider == EmailProvider.AWS_SES:
-            self._ses_client = boto3.client(
-                "ses",
-                region_name=ses_settings.AWS_REGION,
-                aws_access_key_id=ses_settings.AWS_ACCESS_KEY_ID or None,
-                aws_secret_access_key=ses_settings.AWS_SECRET_ACCESS_KEY or None,
-            )
-
-    @staticmethod
-    def convert_basic_markdown(text: str) -> str:
-        """Convert basic markdown to HTML."""
-        # Bold
-        text = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", text)
-        # Color
-        text = re.sub(
-            r"\{color:(.*?)\}(.*?)\{/color\}", r'<span style="color:\1">\2</span>', text
+    def __init__(self):
+        """Initialize email service with AWS SES client."""
+        self._ses_client = boto3.client(
+            "ses",
+            region_name=ses_settings.AWS_REGION,
+            aws_access_key_id=ses_settings.AWS_ACCESS_KEY_ID or None,
+            aws_secret_access_key=ses_settings.AWS_SECRET_ACCESS_KEY or None,
         )
-        # Size
-        text = re.sub(
-            r"\{size:(.*?)\}(.*?)\{/size\}",
-            r'<span style="font-size:\1">\2</span>',
-            text,
-        )
-        # Newlines
-        text = text.replace("\n", "<br>")
-        return text
 
     async def send_email(
-        self,
-        to_email: str,
-        subject: str,
-        content: str,
-        cc_email: Optional[list[str]] = None,
-    ) -> bool:
-        """Send email using configured provider."""
-        if self.provider == EmailProvider.AWS_SES:
-            return await self._send_email_ses(to_email, subject, content, cc_email)
-        else:
-            return await self._send_email_smtp(to_email, subject, content, cc_email)
-
-    async def _send_email_smtp(
-        self,
-        to_email: str,
-        subject: str,
-        content: str,
-        cc_email: Optional[list[str]] = None,
-    ) -> bool:
-        """Send email via Google Workspace SMTP."""
-        try:
-            html_content = f"""
-            <html>
-                <body>
-                    {self.convert_basic_markdown(content)}
-                </body>
-            </html>
-            """
-
-            message = MIMEMultipart("alternative")
-            message["Subject"] = subject
-            message["From"] = formataddr(
-                (smtp_settings.SEND_FROM_NAME, smtp_settings.SMTP_USER)
-            )
-            message["To"] = to_email
-
-            if cc_email:
-                message["Cc"] = ", ".join(cc_email)
-
-            text_part = MIMEText(content, "plain")
-            html_part = MIMEText(html_content, "html")
-            message.attach(text_part)
-            message.attach(html_part)
-
-            async with SMTP(
-                hostname=smtp_settings.SMTP_HOST,
-                port=smtp_settings.SMTP_PORT,
-                use_tls=True,
-            ) as smtp:
-                await smtp.login(smtp_settings.SMTP_USER, smtp_settings.SMTP_PASSWORD)
-                await smtp.send_message(message)
-
-            logger.info(f"SMTP Email sent successfully to {to_email}")
-            return True
-
-        except Exception as e:
-            logger.error(f"SMTP Error sending email: {str(e)}")
-            return False
-
-    async def _send_email_ses(
         self,
         to_email: str,
         subject: str,
@@ -141,7 +44,7 @@ class EmailService:
             html_content = f"""
             <html>
                 <body>
-                    {self.convert_basic_markdown(content)}
+                    {content.replace(chr(10), "<br>")}
                 </body>
             </html>
             """
@@ -269,50 +172,6 @@ class EmailService:
 </html>
 """
 
-        if self.provider == EmailProvider.AWS_SES:
-            return await self._send_html_email_ses(to_email, subject, html_content)
-        else:
-            return await self._send_html_email_smtp(to_email, subject, html_content)
-
-    async def _send_html_email_smtp(
-        self,
-        to_email: str,
-        subject: str,
-        html_content: str,
-    ) -> bool:
-        """Send HTML email via SMTP."""
-        try:
-            message = MIMEMultipart()
-            message["Subject"] = subject
-            message["From"] = formataddr(
-                (smtp_settings.SEND_FROM_NAME, smtp_settings.SMTP_USER)
-            )
-            message["To"] = to_email
-
-            message.attach(MIMEText(html_content, "html", "utf-8"))
-
-            async with SMTP(
-                hostname=smtp_settings.SMTP_HOST,
-                port=smtp_settings.SMTP_PORT,
-                use_tls=True,
-            ) as smtp:
-                await smtp.login(smtp_settings.SMTP_USER, smtp_settings.SMTP_PASSWORD)
-                await smtp.send_message(message)
-
-            logger.info(f"SMTP training completion email sent to {to_email}")
-            return True
-
-        except Exception as e:
-            logger.error(f"SMTP error sending training completion email to {to_email}: {str(e)}")
-            return False
-
-    async def _send_html_email_ses(
-        self,
-        to_email: str,
-        subject: str,
-        html_content: str,
-    ) -> bool:
-        """Send HTML email via SES."""
         try:
             response = self._ses_client.send_email(
                 Source=f"{ses_settings.SEND_FROM_NAME} <{ses_settings.SES_FROM_EMAIL}>",
@@ -338,28 +197,21 @@ class EmailService:
             return False
 
 
-# Singleton cache per provider
-_email_service_cache: dict[EmailProvider, EmailService] = {}
+_email_service: Optional[EmailService] = None
 
 
-def get_email_service(provider: EmailProvider) -> EmailService:
+def get_email_service() -> EmailService:
     """
-    Get or create EmailService instance (singleton per provider).
-
-    Args:
-        provider: Email provider to use
+    Get or create EmailService instance (singleton).
 
     Returns:
-        Cached EmailService instance for the specified provider
+        Cached EmailService instance
 
     Example:
-        # Use Google Workspace SMTP
-        email_service = get_email_service(EmailProvider.GOOGLE_WORKSPACE)
-
-        # Use AWS SES
-        email_service = get_email_service(EmailProvider.AWS_SES)
+        email_service = get_email_service()
+        await email_service.send_email("user@example.com", "Subject", "Content")
     """
-    if provider not in _email_service_cache:
-        _email_service_cache[provider] = EmailService(provider)
-
-    return _email_service_cache[provider]
+    global _email_service
+    if _email_service is None:
+        _email_service = EmailService()
+    return _email_service

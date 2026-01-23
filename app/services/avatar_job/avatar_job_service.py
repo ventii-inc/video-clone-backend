@@ -12,11 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db_session
 from app.models import AvatarJob, User, VideoModel
 from app.models.avatar_job import JobStatus
-from app.models.video_model import ModelStatus
+from app.models.video_model import ModelStatus, ProcessingStage
 from app.services.avatar_job.runpod_client import runpod_client
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
-from app.services.email import EmailProvider, TrainingCompletionData, get_email_service
+from app.services.email import TrainingCompletionData, get_email_service
+from app.services.progress import update_video_model_progress
 from app.services.s3 import s3_service
 from app.utils import logger
 
@@ -231,9 +232,11 @@ class AvatarJobService:
         job.started_at = datetime.utcnow()
         job.attempts += 1
 
-        # Update video model status
+        # Update video model status with progress
         video_model.status = ModelStatus.PROCESSING.value
         video_model.processing_started_at = datetime.utcnow()
+        video_model.processing_stage = ProcessingStage.PREPARING.value
+        video_model.progress_percent = 10  # 10% - Starting preparation
 
         await db.commit()
 
@@ -262,9 +265,19 @@ class AvatarJobService:
             if video_model.local_video_path and os.path.exists(video_model.local_video_path):
                 video_path = video_model.local_video_path
                 logger.info(f"Using local video file: {video_path}")
+                # Update progress: preparation done, ready for training
+                await update_video_model_progress(
+                    db, job.video_model_id, ProcessingStage.PREPARING, 18
+                )
             else:
                 # Fallback: Download video from S3 to temp file
                 logger.info(f"Local video not found, downloading from S3: {video_model.source_video_key}")
+
+                # Update progress: downloading
+                await update_video_model_progress(
+                    db, job.video_model_id, ProcessingStage.PREPARING, 12
+                )
+
                 ext = os.path.splitext(video_model.source_video_key)[1] or ".mp4"
                 with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                     temp_video_path = tmp.name
@@ -279,6 +292,16 @@ class AvatarJobService:
                 video_path = temp_video_path
                 use_temp_file = True
 
+                # Update progress: download complete
+                await update_video_model_progress(
+                    db, job.video_model_id, ProcessingStage.PREPARING, 18
+                )
+
+            # Update progress: starting training (20-80% range)
+            await update_video_model_progress(
+                db, job.video_model_id, ProcessingStage.TRAINING, 20
+            )
+
             # Run avatar generation via CLI
             logger.info(f"Starting CLI avatar generation for {job.video_model_id}")
             result = await livetalking_cli_service.generate_avatar(
@@ -290,11 +313,16 @@ class AvatarJobService:
             )
 
             if result.success:
+                # Update progress: training complete, finalizing
+                await update_video_model_progress(
+                    db, job.video_model_id, ProcessingStage.FINALIZING, 85
+                )
                 # Job completed successfully
                 await self.mark_completed(
                     job.id,
                     avatar_s3_key=result.s3_key or f"avatars/{job.user_id}/{job.video_model_id}.tar",
                     db=db,
+                    execution_mode="cli",
                 )
                 logger.info(
                     f"CLI avatar generation completed: {job.video_model_id}, "
@@ -367,6 +395,7 @@ class AvatarJobService:
                 upload_url=response.upload_url,
                 runpod_job_id=response.job_id,
                 db=db,
+                execution_mode="api",
             )
             return True
         else:
@@ -396,6 +425,7 @@ class AvatarJobService:
         db: AsyncSession,
         upload_url: Optional[str] = None,
         runpod_job_id: Optional[str] = None,
+        execution_mode: Optional[str] = None,
     ) -> None:
         """Mark a job as completed and update the video model"""
         result = await db.execute(select(AvatarJob).where(AvatarJob.id == job_id))
@@ -423,6 +453,10 @@ class AvatarJobService:
             video_model.model_data_key = avatar_s3_key
             video_model.processing_completed_at = datetime.utcnow()
             video_model.error_message = None
+            video_model.progress_percent = 100
+            video_model.processing_stage = ProcessingStage.COMPLETED.value
+            if execution_mode:
+                video_model.execution_mode = execution_mode
 
         # Fetch user for email notification
         user_result = await db.execute(select(User).where(User.id == job.user_id))
@@ -433,7 +467,7 @@ class AvatarJobService:
         # Send training completion email
         if user and user.email:
             try:
-                email_service = get_email_service(EmailProvider.GOOGLE_WORKSPACE)
+                email_service = get_email_service()
                 await email_service.send_training_completion_email(
                     to_email=user.email,
                     data=TrainingCompletionData(
@@ -479,6 +513,8 @@ class AvatarJobService:
             video_model.status = ModelStatus.FAILED.value
             video_model.error_message = error_message
             video_model.processing_completed_at = datetime.utcnow()
+            video_model.processing_stage = ProcessingStage.FAILED.value
+            # Keep current progress_percent to show where it failed
 
         await db.commit()
 
@@ -526,6 +562,8 @@ class AvatarJobService:
         if video_model:
             video_model.status = ModelStatus.PENDING.value
             video_model.error_message = None
+            video_model.progress_percent = 0
+            video_model.processing_stage = ProcessingStage.PENDING.value
 
         await db.commit()
         await db.refresh(job)
