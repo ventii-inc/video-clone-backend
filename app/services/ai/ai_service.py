@@ -296,7 +296,7 @@ class AIService:
                 raise ValueError("No source audio key found")
 
             audio_url = await s3_service.generate_presigned_url(
-                model.source_audio_key, expires_in=3600
+                model.source_audio_key, expiration=3600
             )
 
             # Clone voice using Fish Audio
