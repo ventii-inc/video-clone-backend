@@ -1,7 +1,7 @@
 """Add processing_stage to generated_videos
 
-Revision ID: 0a5b6c7d8e9f
-Revises: 9c4d0e1f2a3b
+Revision ID: d4e5f6g7h8i9
+Revises: c3d4e5f6g7h8
 Create Date: 2026-01-23 10:00:00.000000
 
 """
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '0a5b6c7d8e9f'
-down_revision: Union[str, None] = '9c4d0e1f2a3b'
+revision: str = 'd4e5f6g7h8i9'
+down_revision: Union[str, None] = 'c3d4e5f6g7h8'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
