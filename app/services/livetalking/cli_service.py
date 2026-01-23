@@ -20,6 +20,10 @@ from app.services.s3 import s3_service
 
 logger = logging.getLogger(__name__)
 
+# Frame limits for avatar generation
+MAX_FRAMES_DEFAULT = 1000  # For normal avatars (with speech)
+MAX_FRAMES_SILENT = 100    # For silent/idle avatars
+
 
 @dataclass
 class AvatarGenerationResult:
@@ -171,6 +175,8 @@ class LiveTalkingCLIService:
         pads: str = "0 10 0 0",
         face_det_batch_size: int = 16,
         upload_to_s3: bool = True,
+        max_frames: int = MAX_FRAMES_DEFAULT,
+        silent: bool = False,
     ) -> AvatarGenerationResult:
         """
         Generate an avatar from a video file using CLI.
@@ -183,10 +189,16 @@ class LiveTalkingCLIService:
             pads: Padding values "top bottom left right"
             face_det_batch_size: Batch size for face detection
             upload_to_s3: Whether to upload avatar TAR to S3
+            max_frames: Maximum frames to extract (default: 1000)
+            silent: If True, uses reduced frame count (100) for idle avatars
 
         Returns:
             AvatarGenerationResult with status and paths
         """
+        # Use reduced frame count for silent/idle avatars
+        if silent:
+            max_frames = MAX_FRAMES_SILENT
+
         self._ensure_avatar_directory()
 
         # Build command
@@ -200,7 +212,10 @@ class LiveTalkingCLIService:
             "--img_size", str(img_size),
             "--pads", *pads.split(),
             "--face_det_batch_size", str(face_det_batch_size),
+            "--max_frames", str(max_frames),
         ]
+
+        logger.info(f"Generating avatar with max_frames={max_frames} (silent={silent})")
 
         # Execute command
         return_code, stdout, stderr = await self._run_cli_command(
