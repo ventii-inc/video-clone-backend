@@ -9,6 +9,7 @@ from app.schemas.common import UploadInfo, PaginationMeta
 
 
 ModelStatus = Literal["pending", "uploading", "processing", "completed", "failed"]
+ProcessingStage = Literal["pending", "uploading", "preparing", "training", "finalizing", "completed", "failed"]
 
 
 class VideoModelCreate(BaseModel):
@@ -43,6 +44,8 @@ class VideoModelResponse(BaseModel):
     duration_seconds: int | None
     file_size_bytes: int | None
     status: ModelStatus
+    progress_percent: int = 0
+    processing_stage: ProcessingStage = "pending"
     error_message: str | None = None
     processing_started_at: datetime | None = None
     processing_completed_at: datetime | None = None
@@ -60,6 +63,8 @@ class VideoModelBrief(BaseModel):
     thumbnail_url: str | None
     duration_seconds: int | None
     status: ModelStatus
+    progress_percent: int = 0
+    processing_stage: ProcessingStage = "pending"
     created_at: datetime
 
     class Config:

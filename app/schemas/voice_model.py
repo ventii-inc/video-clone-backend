@@ -10,6 +10,7 @@ from app.schemas.common import UploadInfo, PaginationMeta
 
 ModelStatus = Literal["pending", "uploading", "processing", "completed", "failed"]
 SourceType = Literal["upload", "recording"]
+Visibility = Literal["private", "public", "unlist"]
 
 
 class VoiceModelCreate(BaseModel):
@@ -23,7 +24,8 @@ class VoiceModelCreate(BaseModel):
 
 class VoiceModelUpdate(BaseModel):
     """Voice model update request"""
-    name: str = Field(..., min_length=1, max_length=100)
+    name: str | None = Field(None, min_length=1, max_length=100)
+    visibility: Visibility | None = Field(None, description="Model visibility: private, public, or unlist")
 
 
 class VoiceModelUploadCompleteRequest(BaseModel):
@@ -40,6 +42,7 @@ class VoiceModelResponse(BaseModel):
     duration_seconds: int | None
     file_size_bytes: int | None
     status: ModelStatus
+    visibility: Visibility = "private"
     error_message: str | None = None
     processing_started_at: datetime | None = None
     processing_completed_at: datetime | None = None
@@ -57,6 +60,7 @@ class VoiceModelBrief(BaseModel):
     source_type: SourceType
     duration_seconds: int | None
     status: ModelStatus
+    visibility: Visibility = "private"
     created_at: datetime
 
     class Config:

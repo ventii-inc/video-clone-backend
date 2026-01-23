@@ -24,6 +24,12 @@ class SourceType(str, PyEnum):
     RECORDING = "recording"
 
 
+class Visibility(str, PyEnum):
+    PRIVATE = "private"
+    PUBLIC = "public"
+    UNLIST = "unlist"
+
+
 class VoiceModel(Base):
     """Stores user's voice clone models created from uploaded audio"""
 
@@ -39,6 +45,7 @@ class VoiceModel(Base):
     duration_seconds = Column(Integer, nullable=True)
     file_size_bytes = Column(Integer, nullable=True)
     status = Column(String(20), default=ModelStatus.PENDING.value, nullable=False, index=True)
+    visibility = Column(String(20), default=Visibility.PRIVATE.value, nullable=False)
     error_message = Column(Text, nullable=True)
     processing_started_at = Column(DateTime, nullable=True)
     processing_completed_at = Column(DateTime, nullable=True)
