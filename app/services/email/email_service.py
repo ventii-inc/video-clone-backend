@@ -20,6 +20,17 @@ class TrainingCompletionData:
     dashboard_url: Optional[str] = None
 
 
+@dataclass
+class VideoGenerationCompletionData:
+    """Data for video generation completion email."""
+
+    user_name: str
+    video_title: str
+    duration_seconds: Optional[int] = None
+    video_url: Optional[str] = None
+    dashboard_url: Optional[str] = None
+
+
 class EmailService:
     """Email service using AWS SES."""
 
@@ -90,17 +101,17 @@ class EmailService:
         Returns:
             True if email sent successfully, False otherwise
         """
-        model_type_display = "Video Avatar" if data.model_type == "video" else "Voice Model"
-        subject = f"Your {model_type_display} Training is Complete!"
+        model_type_display = "ビデオアバター" if data.model_type == "video" else "ボイスモデル"
+        subject = f"{model_type_display}のトレーニングが完了しました"
 
         dashboard_section = ""
         if data.dashboard_url:
             dashboard_section = f"""
                 <p>
-                    <a href="{data.dashboard_url}" class="button">View in Dashboard</a>
+                    <a href="{data.dashboard_url}" class="button">ダッシュボードで確認</a>
                 </p>
                 <p style="font-size: 12px; color: #666;">
-                    Or copy this link: <a href="{data.dashboard_url}">{data.dashboard_url}</a>
+                    リンク: <a href="{data.dashboard_url}">{data.dashboard_url}</a>
                 </p>
             """
 
@@ -143,22 +154,22 @@ class EmailService:
 <body>
     <div class="container">
         <div class="header">
-            <h1>Training Complete!</h1>
+            <h1>トレーニング完了</h1>
         </div>
         <div class="content">
-            <p>Hi {data.user_name},</p>
+            <p>{data.user_name} 様</p>
 
-            <p>Great news! Your {model_type_display.lower()} has finished training and is now ready to use.</p>
+            <p>{model_type_display}のトレーニングが完了し、ご利用いただける状態になりました。</p>
 
             <div class="model-info">
-                <strong>Model Details:</strong><br>
-                <strong>Name:</strong> {data.model_name}<br>
-                <strong>Type:</strong> {model_type_display}
+                <strong>モデル詳細:</strong><br>
+                <strong>名前:</strong> {data.model_name}<br>
+                <strong>種類:</strong> {model_type_display}
             </div>
 
             {dashboard_section}
 
-            <p>You can now start generating videos using your new {model_type_display.lower()}.</p>
+            <p>新しい{model_type_display}を使って、動画の生成を開始できます。</p>
 
             <div class="footer">
                 --------------------------<br>
@@ -194,6 +205,149 @@ class EmailService:
             return False
         except Exception as e:
             logger.error(f"Error sending training completion email to {to_email}: {str(e)}")
+            return False
+
+    async def send_video_generation_completion_email(
+        self,
+        to_email: str,
+        data: VideoGenerationCompletionData,
+    ) -> bool:
+        """
+        Send video generation completion notification email.
+
+        Args:
+            to_email: Recipient email address
+            data: Video generation completion data
+
+        Returns:
+            True if email sent successfully, False otherwise
+        """
+        subject = "動画の生成が完了しました"
+
+        duration_display = ""
+        if data.duration_seconds:
+            minutes = data.duration_seconds // 60
+            seconds = data.duration_seconds % 60
+            if minutes > 0:
+                duration_display = f"{minutes}分{seconds}秒"
+            else:
+                duration_display = f"{seconds}秒"
+
+        video_section = ""
+        if data.video_url:
+            video_section = f"""
+                <p>
+                    <a href="{data.video_url}" class="button">動画を見る</a>
+                </p>
+            """
+
+        dashboard_section = ""
+        if data.dashboard_url:
+            dashboard_section = f"""
+                <p>
+                    <a href="{data.dashboard_url}" class="button-secondary">ダッシュボードで確認</a>
+                </p>
+            """
+
+        html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .header {{ background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%); color: white; padding: 30px; text-align: center; border-radius: 8px 8px 0 0; }}
+        .content {{ background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px; }}
+        .button {{
+            display: inline-block;
+            padding: 12px 24px;
+            background: #11998e;
+            color: white !important;
+            text-decoration: none;
+            border-radius: 6px;
+            margin: 20px 0;
+        }}
+        .button-secondary {{
+            display: inline-block;
+            padding: 10px 20px;
+            background: #666;
+            color: white !important;
+            text-decoration: none;
+            border-radius: 6px;
+            margin: 10px 0;
+            font-size: 14px;
+        }}
+        .video-info {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #11998e;
+        }}
+        .footer {{
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+            color: #666;
+            font-size: 12px;
+            text-align: center;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>動画の生成が完了しました</h1>
+        </div>
+        <div class="content">
+            <p>{data.user_name} 様</p>
+
+            <p>動画の生成が完了し、視聴いただける状態になりました。</p>
+
+            <div class="video-info">
+                <strong>動画の詳細:</strong><br>
+                <strong>タイトル:</strong> {data.video_title or "無題"}<br>
+                {f'<strong>再生時間:</strong> {duration_display}<br>' if duration_display else ''}
+            </div>
+
+            {video_section}
+            {dashboard_section}
+
+            <div class="footer">
+                --------------------------<br>
+                Ventii Video Clone<br>
+                <a href="https://ventii.jp/">https://ventii.jp/</a><br>
+                --------------------------
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+        try:
+            response = self._ses_client.send_email(
+                Source=f"{ses_settings.SEND_FROM_NAME} <{ses_settings.SES_FROM_EMAIL}>",
+                Destination={"ToAddresses": [to_email]},
+                Message={
+                    "Subject": {"Data": subject, "Charset": "UTF-8"},
+                    "Body": {"Html": {"Data": html_content, "Charset": "UTF-8"}},
+                },
+            )
+
+            logger.info(
+                f"SES video generation completion email sent to {to_email}, MessageId: {response['MessageId']}"
+            )
+            return True
+
+        except ClientError as e:
+            logger.error(
+                f"SES error sending video generation completion email to {to_email}: {e.response['Error']['Message']}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"Error sending video generation completion email to {to_email}: {str(e)}")
             return False
 
 
