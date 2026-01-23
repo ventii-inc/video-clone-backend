@@ -425,12 +425,18 @@ async def process_direct_upload_task(
             await avatar_job_service.process_pending_jobs(db)
 
     # Run S3 upload, thumbnail generation, and avatar generation in parallel
-    await asyncio.gather(
+    task_names = ["upload_to_s3", "generate_thumbnail", "generate_avatar"]
+    results = await asyncio.gather(
         upload_to_s3(),
         generate_and_upload_thumbnail(),
         generate_avatar(),
         return_exceptions=True,
     )
+
+    # Log any exceptions from background tasks
+    for name, result in zip(task_names, results):
+        if isinstance(result, Exception):
+            logger.error(f"Background task '{name}' failed for model {model_id}: {result}")
 
 
 @router.post("/{model_id}/upload-complete", response_model=dict)
