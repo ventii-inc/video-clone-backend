@@ -71,11 +71,7 @@ async def list_videos(
     else:
         query = query.order_by(sort_column.desc())
 
-    # Apply pagination and eager load relationships
-    query = query.options(
-        selectinload(GeneratedVideo.video_model),
-        selectinload(GeneratedVideo.voice_model),
-    )
+    # Apply pagination
     query = query.offset((page - 1) * limit).limit(limit)
 
     result = await db.execute(query)
@@ -104,8 +100,8 @@ async def list_videos(
                 duration_seconds=video.duration_seconds,
                 resolution=video.resolution,
                 status=video.status,
-                video_model=VideoModelBrief.model_validate(video.video_model) if video.video_model else None,
-                voice_model=VoiceModelBrief.model_validate(video.voice_model) if video.voice_model else None,
+                video_model_id=video.video_model_id,
+                voice_model_id=video.voice_model_id,
                 created_at=video.created_at,
             )
         )
@@ -169,6 +165,8 @@ async def get_video(
         resolution=video.resolution,
         credits_used=video.credits_used,
         status=video.status,
+        processing_stage=video.processing_stage,
+        progress_percent=video.progress_percent,
         error_message=video.error_message,
         video_model=VideoModelBrief.model_validate(video.video_model) if video.video_model else None,
         voice_model=VoiceModelBrief.model_validate(video.voice_model) if video.voice_model else None,

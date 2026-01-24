@@ -13,6 +13,7 @@ from app.models.voice_model import ModelStatus as VoiceModelStatus
 from app.models.generated_video import GenerationStatus
 from app.services.firebase import get_current_user
 from app.services.ai import ai_service
+from app.services.s3 import s3_service
 from app.services.usage_service import usage_service
 from app.schemas.generated_video import (
     GenerateVideoRequest,
@@ -197,14 +198,23 @@ async def get_generation_status(
             elapsed = 10  # Assume ~10 seconds have passed
             estimated_remaining = int(elapsed * (100 - video.progress_percent) / video.progress_percent)
 
+    # Generate presigned URL for completed videos
+    output_video_url = None
+    if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+        try:
+            output_video_url = await s3_service.generate_presigned_url(video.output_video_key)
+        except Exception:
+            pass
+
     return GenerationStatusResponse(
         video=GenerationStatusDetail(
             id=video.id,
             status=video.status,
+            processing_stage=video.processing_stage,
             queue_position=video.queue_position,
             progress_percent=video.progress_percent,
             estimated_remaining_seconds=estimated_remaining,
-            output_video_url=video.output_video_url,
+            output_video_url=output_video_url,
             thumbnail_url=video.thumbnail_url,
             duration_seconds=video.duration_seconds,
             file_size_bytes=video.file_size_bytes,

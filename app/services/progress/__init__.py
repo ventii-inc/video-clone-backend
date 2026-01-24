@@ -4,10 +4,12 @@ from app.services.progress.progress_service import (
     VideoModelProgressTracker,
     update_video_model_progress,
     calculate_training_progress,
+    calculate_expected_generation_time,
 )
 
 __all__ = [
     "VideoModelProgressTracker",
     "update_video_model_progress",
     "calculate_training_progress",
+    "calculate_expected_generation_time",
 ]

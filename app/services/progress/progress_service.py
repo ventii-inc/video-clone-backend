@@ -35,6 +35,44 @@ PROGRESS_FINALIZE_END = 100
 EXPECTED_TRAINING_TIME_SECONDS = 300  # 5 minutes expected
 
 
+def calculate_expected_generation_time(text: str) -> float:
+    """
+    Calculate expected video generation time based on word count.
+
+    Formula:
+    - Base time for first 200 words: 240 seconds (4 minutes)
+    - Each additional 100 words: +30 seconds
+
+    Progress 80-100% is reserved for actual completion only.
+
+    Examples:
+        50 words  -> 240s (4 min)
+        200 words -> 240s (4 min)
+        300 words -> 270s (4.5 min)
+        500 words -> 330s (5.5 min)
+        1000 words -> 480s (8 min)
+
+    Args:
+        text: The input text for video generation
+
+    Returns:
+        Expected generation time in seconds
+    """
+    word_count = len(text.split())
+
+    # Base time for first 200 words: 4 minutes
+    base_seconds = 240.0
+
+    # Additional time for words beyond 200: 30 seconds per 100 words
+    if word_count > 200:
+        extra_words = word_count - 200
+        additional_seconds = (extra_words / 100) * 30
+    else:
+        additional_seconds = 0.0
+
+    return base_seconds + additional_seconds
+
+
 def calculate_training_progress(
     elapsed_seconds: float,
     expected_seconds: float = EXPECTED_TRAINING_TIME_SECONDS,

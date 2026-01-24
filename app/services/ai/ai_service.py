@@ -20,7 +20,7 @@ from sqlalchemy import select
 from app.models.video_model import VideoModel, ModelStatus as VideoModelStatus
 from app.models.voice_model import VoiceModel, ModelStatus as VoiceModelStatus
 from app.models.generated_video import GeneratedVideo, GenerationStatus, VideoGenerationStage
-from app.services.progress import calculate_training_progress
+from app.services.progress import calculate_training_progress, calculate_expected_generation_time
 from app.db import get_db_session
 from app.models.user import User
 from app.services.s3 import s3_service
@@ -52,9 +52,6 @@ class AIService:
     VIDEO_MODEL_PROCESSING_TIME = 5  # Real: 5-30 minutes
     VOICE_MODEL_PROCESSING_TIME = 3  # Real: 2-10 minutes
     VIDEO_GENERATION_TIME = 4  # Real: varies by text length
-
-    # Expected video generation time for progress calculation (seconds)
-    EXPECTED_VIDEO_GENERATION_TIME = 60  # Typical video generation takes ~60 seconds
 
     def _calculate_minutes_from_duration(self, duration_seconds: int | None) -> int:
         """Calculate billable minutes from video duration in seconds.
@@ -503,7 +500,7 @@ class AIService:
     async def _run_video_progress_updater(
         self,
         video_id: UUID,
-        expected_seconds: float = None,
+        input_text: str,
     ) -> None:
         """
         Periodically update video generation progress using asymptotic formula.
@@ -511,9 +508,13 @@ class AIService:
         This runs concurrently with the actual generation, updating progress
         from 20% toward 78% (never reaching 80% until actual completion).
         Uses its own DB session since the main session is held during CLI.
+
+        Expected time is calculated based on word count:
+        - Base time for first 200 words: 240 seconds (4 minutes)
+        - Each additional 100 words: +30 seconds
+        - Progress 80-100% is reserved for actual completion only
         """
-        if expected_seconds is None:
-            expected_seconds = self.EXPECTED_VIDEO_GENERATION_TIME
+        expected_seconds = calculate_expected_generation_time(input_text)
 
         start_time = datetime.utcnow()
 
@@ -590,9 +591,9 @@ class AIService:
             video.progress_percent = 20
             await db.commit()
 
-            # Start concurrent progress updater
+            # Start concurrent progress updater with text-based expected time
             progress_task = asyncio.create_task(
-                self._run_video_progress_updater(video.id)
+                self._run_video_progress_updater(video.id, video.input_text)
             )
 
             # Run CLI video generation
