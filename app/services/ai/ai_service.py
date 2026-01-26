@@ -616,6 +616,9 @@ class AIService:
                     pass
 
             if not result.success:
+                # Store log file path even on failure for debugging
+                video.output_file = result.output_file
+                await db.commit()
                 raise ValueError(result.error or "Video generation failed")
 
             # Update video record with results - COMPLETED
@@ -625,6 +628,7 @@ class AIService:
             video.progress_percent = 100
             video.duration_seconds = int(result.duration) if result.duration else None
             video.output_video_key = result.s3_key
+            video.output_file = result.output_file
 
             # Get file size
             if os.path.exists(output_path):

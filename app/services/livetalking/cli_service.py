@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 MAX_FRAMES_DEFAULT = 1800  # For normal avatars (~1 min at 30fps)
 MAX_FRAMES_SILENT = 100    # For silent/idle avatars
 
+# Output directories for job logs
+VIDEO_JOBS_OUTPUT_DIR = "/tmp/video_jobs"
+
 
 @dataclass
 class AvatarGenerationResult:
@@ -50,6 +53,7 @@ class VideoGenerationResult:
     total_time: Optional[float] = None
     error: Optional[str] = None
     s3_key: Optional[str] = None
+    output_file: Optional[str] = None  # Path to log file
 
 
 class LiveTalkingCLIService:
@@ -92,6 +96,7 @@ class LiveTalkingCLIService:
         command: list[str],
         timeout: int = 600,
         cwd: Optional[str] = None,
+        output_file: Optional[str] = None,
     ) -> tuple[int, str, str]:
         """
         Run a CLI command in LiveTalking's venv.
@@ -100,6 +105,7 @@ class LiveTalkingCLIService:
             command: Command and arguments to run
             timeout: Timeout in seconds
             cwd: Working directory (defaults to livetalking_root)
+            output_file: Optional path to write stdout/stderr logs
 
         Returns:
             Tuple of (return_code, stdout, stderr)
@@ -126,6 +132,14 @@ class LiveTalkingCLIService:
         logger.info(f"Running CLI command: {full_command}")
         logger.info(f"Working directory: {work_dir}")
         logger.info(f"PYTHONPATH: {pythonpath}")
+        if output_file:
+            logger.info(f"Output file: {output_file}")
+
+        # Ensure output directory exists if output_file specified
+        log_file = None
+        if output_file:
+            Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+            log_file = open(output_file, 'w')
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -144,6 +158,18 @@ class LiveTalkingCLIService:
             stdout_str = stdout.decode("utf-8") if stdout else ""
             stderr_str = stderr.decode("utf-8") if stderr else ""
 
+            # Write to log file if specified
+            if log_file:
+                if stdout_str:
+                    log_file.write("=== STDOUT ===\n")
+                    log_file.write(stdout_str)
+                    log_file.write("\n")
+                if stderr_str:
+                    log_file.write("=== STDERR ===\n")
+                    log_file.write(stderr_str)
+                    log_file.write("\n")
+                log_file.write(f"=== EXIT CODE: {process.returncode} ===\n")
+
             logger.info(f"Command exit code: {process.returncode}")
             if stdout_str:
                 logger.info(f"stdout (first 1000 chars): {stdout_str[:1000]}")
@@ -155,11 +181,18 @@ class LiveTalkingCLIService:
             return process.returncode, stdout_str, stderr_str
 
         except asyncio.TimeoutError:
-            logger.error(f"Command timed out after {timeout}s: {cmd_str}")
+            logger.error(f"Command timed out after {timeout}s: {full_command}")
+            if log_file:
+                log_file.write(f"=== TIMEOUT after {timeout}s ===\n")
             return -1, "", f"Command timed out after {timeout} seconds"
         except Exception as e:
             logger.error(f"Command execution failed: {e}")
+            if log_file:
+                log_file.write(f"=== ERROR: {e} ===\n")
             return -1, "", str(e)
+        finally:
+            if log_file:
+                log_file.close()
 
     def _run_cli_command_detached(
         self,
@@ -662,6 +695,10 @@ class LiveTalkingCLIService:
         # Ensure output directory exists
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+        # Create log file for CLI output
+        Path(VIDEO_JOBS_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+        log_file = os.path.join(VIDEO_JOBS_OUTPUT_DIR, f"{Path(output_path).stem}.log")
+
         # Build command
         command = [
             "python",
@@ -679,6 +716,7 @@ class LiveTalkingCLIService:
         return_code, stdout, stderr = await self._run_cli_command(
             command,
             timeout=self._get_settings().LIVETALKING_VIDEO_TIMEOUT,
+            output_file=log_file,
         )
 
         if return_code != 0:
@@ -687,6 +725,7 @@ class LiveTalkingCLIService:
             return VideoGenerationResult(
                 success=False,
                 error=error_msg[:500],
+                output_file=log_file,
             )
 
         # Check output file exists
@@ -722,6 +761,7 @@ class LiveTalkingCLIService:
             duration=duration,
             inference_time=result_data.get("inference_time"),
             total_time=result_data.get("total_time"),
+            output_file=log_file,
         )
 
         # Upload to S3 if requested

@@ -54,6 +54,7 @@ class GeneratedVideo(Base):
     status = Column(String(20), default=GenerationStatus.QUEUED.value, nullable=False, index=True)
     processing_stage = Column(String(20), default=VideoGenerationStage.QUEUED.value, nullable=False)
     error_message = Column(Text, nullable=True)
+    output_file = Column(String(500), nullable=True)  # Path to CLI output log file
     queue_position = Column(Integer, nullable=True)
     progress_percent = Column(Integer, default=0, nullable=False)
     processing_started_at = Column(DateTime, nullable=True)
