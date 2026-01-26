@@ -284,10 +284,10 @@ async def stripe_webhook(
             logger.debug(f"Unhandled webhook event type: {event.type}")
 
     except Exception as e:
-        logger.error(f"Error handling webhook {event.type}: {e}")
+        logger.error(f"Error handling webhook {event.type}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Webhook processing error",
+            detail=f"Webhook processing error: {str(e)}",
         )
 
     return {"status": "success"}

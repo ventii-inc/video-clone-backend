@@ -188,14 +188,32 @@ class StripeService:
             stripe_settings.stripe_webhook_secret,
         )
 
+    def _get_session_attr(self, session, key: str, default=None):
+        """Safely get attribute from session (works for both dict and StripeObject)"""
+        if isinstance(session, dict):
+            return session.get(key, default)
+        return getattr(session, key, default)
+
     async def handle_checkout_completed(
         self,
-        session: stripe.checkout.Session,
+        session,  # Can be dict or StripeObject
         db: AsyncSession,
     ) -> None:
         """Handle checkout.session.completed event"""
-        user_id = int(session.metadata.get("user_id"))
-        checkout_type = session.metadata.get("type")
+        # Safely access metadata (works for both dict and StripeObject)
+        metadata = self._get_session_attr(session, "metadata", {})
+        if isinstance(metadata, dict):
+            user_id_str = metadata.get("user_id")
+            checkout_type = metadata.get("type")
+        else:
+            user_id_str = getattr(metadata, "user_id", None) or metadata.get("user_id")
+            checkout_type = getattr(metadata, "type", None) or metadata.get("type")
+
+        if not user_id_str:
+            logger.error(f"No user_id in checkout session metadata: {session}")
+            return
+
+        user_id = int(user_id_str)
 
         logger.info(
             f"Processing checkout completed: user_id={user_id}, type={checkout_type}"
@@ -208,44 +226,63 @@ class StripeService:
 
     async def _handle_subscription_checkout(
         self,
-        session: stripe.checkout.Session,
+        session,  # Can be dict or StripeObject
         user_id: int,
         db: AsyncSession,
     ) -> None:
         """Handle subscription checkout completion"""
-        stripe_subscription = stripe.Subscription.retrieve(session.subscription)
+        # Safely get subscription ID
+        subscription_id = self._get_session_attr(session, "subscription")
+
+        if not subscription_id:
+            logger.error(f"No subscription ID in checkout session for user {user_id}")
+            return
+
+        logger.info(f"Retrieving Stripe subscription {subscription_id} for user {user_id}")
+        stripe_subscription = stripe.Subscription.retrieve(subscription_id)
 
         result = await db.execute(
             select(Subscription).where(Subscription.user_id == user_id)
         )
         subscription = result.scalar_one_or_none()
 
-        if subscription:
-            subscription.stripe_subscription_id = stripe_subscription.id
-            subscription.plan_type = PlanType.STANDARD.value
-            subscription.status = SubscriptionStatus.ACTIVE.value
-            subscription.monthly_minutes_limit = stripe_settings.subscription_monthly_minutes
-            subscription.current_period_start = datetime.fromtimestamp(
-                stripe_subscription.current_period_start
-            )
-            subscription.current_period_end = datetime.fromtimestamp(
-                stripe_subscription.current_period_end
-            )
-            subscription.canceled_at = None
+        if not subscription:
+            logger.error(f"No subscription record found for user {user_id}")
+            return
+
+        subscription.stripe_subscription_id = stripe_subscription.id
+        subscription.plan_type = PlanType.STANDARD.value
+        subscription.status = SubscriptionStatus.ACTIVE.value
+        subscription.monthly_minutes_limit = stripe_settings.subscription_monthly_minutes
+        subscription.current_period_start = datetime.fromtimestamp(
+            stripe_subscription.current_period_start
+        )
+        subscription.current_period_end = datetime.fromtimestamp(
+            stripe_subscription.current_period_end
+        )
+        subscription.canceled_at = None
 
         await db.commit()
         logger.info(f"Activated subscription for user {user_id}")
 
     async def _handle_minutes_checkout(
         self,
-        session: stripe.checkout.Session,
+        session,  # Can be dict or StripeObject
         user_id: int,
         db: AsyncSession,
     ) -> None:
         """Handle minutes purchase checkout completion"""
-        minutes_to_add = int(session.metadata.get("minutes_to_add", 0))
-        quantity = int(session.metadata.get("quantity", 1))
+        # Safely access metadata
+        metadata = self._get_session_attr(session, "metadata", {})
+        if isinstance(metadata, dict):
+            minutes_to_add = int(metadata.get("minutes_to_add", 0))
+            quantity = int(metadata.get("quantity", 1))
+        else:
+            minutes_to_add = int(getattr(metadata, "minutes_to_add", 0) or metadata.get("minutes_to_add", 0))
+            quantity = int(getattr(metadata, "quantity", 1) or metadata.get("quantity", 1))
+
         amount = quantity * stripe_settings.minutes_pack_price_jpy
+        payment_intent_id = self._get_session_attr(session, "payment_intent")
 
         # Add minutes to user's account
         await usage_service.add_purchased_minutes(user_id, minutes_to_add, db)
@@ -253,7 +290,7 @@ class StripeService:
         # Record payment history
         payment = PaymentHistory(
             user_id=user_id,
-            stripe_payment_intent_id=session.payment_intent,
+            stripe_payment_intent_id=payment_intent_id,
             payment_type=PaymentType.ADDITIONAL_MINUTES.value,
             amount_cents=amount,  # JPY doesn't use cents, but field is named this way
             currency="jpy",
@@ -267,13 +304,16 @@ class StripeService:
 
     async def handle_subscription_updated(
         self,
-        subscription: stripe.Subscription,
+        subscription,  # Can be dict or StripeObject
         db: AsyncSession,
     ) -> None:
         """Handle customer.subscription.updated event"""
-        user_id = subscription.metadata.get("user_id")
+        metadata = self._get_session_attr(subscription, "metadata", {})
+        user_id = metadata.get("user_id") if isinstance(metadata, dict) else getattr(metadata, "user_id", None)
+        sub_id = self._get_session_attr(subscription, "id")
+
         if not user_id:
-            logger.warning(f"No user_id in subscription metadata: {subscription.id}")
+            logger.warning(f"No user_id in subscription metadata: {sub_id}")
             return
 
         user_id = int(user_id)
@@ -304,13 +344,16 @@ class StripeService:
 
     async def handle_subscription_deleted(
         self,
-        subscription: stripe.Subscription,
+        subscription,  # Can be dict or StripeObject
         db: AsyncSession,
     ) -> None:
         """Handle customer.subscription.deleted event"""
-        user_id = subscription.metadata.get("user_id")
+        metadata = self._get_session_attr(subscription, "metadata", {})
+        user_id = metadata.get("user_id") if isinstance(metadata, dict) else getattr(metadata, "user_id", None)
+        sub_id = self._get_session_attr(subscription, "id")
+
         if not user_id:
-            logger.warning(f"No user_id in subscription metadata: {subscription.id}")
+            logger.warning(f"No user_id in subscription metadata: {sub_id}")
             return
 
         user_id = int(user_id)
@@ -332,15 +375,16 @@ class StripeService:
 
     async def handle_invoice_paid(
         self,
-        invoice: stripe.Invoice,
+        invoice,  # Can be dict or StripeObject
         db: AsyncSession,
     ) -> None:
         """Handle invoice.paid event"""
-        if not invoice.subscription:
+        subscription_id = self._get_session_attr(invoice, "subscription")
+        if not subscription_id:
             return  # Not a subscription invoice
 
         # Get user from customer
-        customer_id = invoice.customer
+        customer_id = self._get_session_attr(invoice, "customer")
         result = await db.execute(
             select(Subscription).where(Subscription.stripe_customer_id == customer_id)
         )
@@ -353,11 +397,11 @@ class StripeService:
         # Record payment
         payment = PaymentHistory(
             user_id=sub_record.user_id,
-            stripe_payment_intent_id=invoice.payment_intent,
-            stripe_invoice_id=invoice.id,
+            stripe_payment_intent_id=self._get_session_attr(invoice, "payment_intent"),
+            stripe_invoice_id=self._get_session_attr(invoice, "id"),
             payment_type=PaymentType.SUBSCRIPTION.value,
-            amount_cents=invoice.amount_paid,
-            currency=invoice.currency,
+            amount_cents=self._get_session_attr(invoice, "amount_paid", 0),
+            currency=self._get_session_attr(invoice, "currency", "jpy"),
             status=PaymentStatus.SUCCEEDED.value,
         )
         db.add(payment)
@@ -367,11 +411,11 @@ class StripeService:
 
     async def handle_invoice_payment_failed(
         self,
-        invoice: stripe.Invoice,
+        invoice,  # Can be dict or StripeObject
         db: AsyncSession,
     ) -> None:
         """Handle invoice.payment_failed event"""
-        customer_id = invoice.customer
+        customer_id = self._get_session_attr(invoice, "customer")
 
         result = await db.execute(
             select(Subscription).where(Subscription.stripe_customer_id == customer_id)
