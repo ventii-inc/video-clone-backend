@@ -250,16 +250,16 @@ class StripeService:
             logger.error(f"No subscription record found for user {user_id}")
             return
 
-        # Use safe property access for stripe_subscription
-        subscription.stripe_subscription_id = self._get_session_attr(stripe_subscription, "id")
+        # Use direct dict access for stripe_subscription (from stripe.Subscription.retrieve)
+        subscription.stripe_subscription_id = stripe_subscription["id"]
         subscription.plan_type = PlanType.STANDARD.value
         subscription.status = SubscriptionStatus.ACTIVE.value
         subscription.monthly_minutes_limit = stripe_settings.subscription_monthly_minutes
         subscription.current_period_start = datetime.fromtimestamp(
-            self._get_session_attr(stripe_subscription, "current_period_start")
+            stripe_subscription["current_period_start"]
         )
         subscription.current_period_end = datetime.fromtimestamp(
-            self._get_session_attr(stripe_subscription, "current_period_end")
+            stripe_subscription["current_period_end"]
         )
         subscription.canceled_at = None
 
