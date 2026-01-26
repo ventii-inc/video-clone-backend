@@ -457,28 +457,47 @@ class StripeService:
         try:
             customer = stripe.Customer.retrieve(subscription.stripe_customer_id)
 
-            # Get default payment method
-            default_pm_id = customer.invoice_settings.default_payment_method
+            # Get default payment method (use dict access for StripeObject)
+            invoice_settings = customer.get("invoice_settings", {})
+            default_pm_id = invoice_settings.get("default_payment_method") if invoice_settings else None
             if not default_pm_id:
                 # Try to get from default source (legacy)
-                default_pm_id = customer.default_source
+                default_pm_id = customer.get("default_source")
 
             if not default_pm_id:
+                # Try to list payment methods attached to customer
+                payment_methods = stripe.PaymentMethod.list(
+                    customer=subscription.stripe_customer_id,
+                    type="card",
+                    limit=1,
+                )
+                pm_data = payment_methods.get("data", [])
+                if pm_data:
+                    payment_method = pm_data[0]
+                    card = payment_method.get("card", {})
+                    return {
+                        "type": "card",
+                        "brand": card.get("brand"),
+                        "last4": card.get("last4"),
+                        "exp_month": card.get("exp_month"),
+                        "exp_year": card.get("exp_year"),
+                    }
                 return None
 
             payment_method = stripe.PaymentMethod.retrieve(default_pm_id)
 
-            if payment_method.type == "card":
-                card = payment_method.card
+            pm_type = payment_method.get("type")
+            if pm_type == "card":
+                card = payment_method.get("card", {})
                 return {
                     "type": "card",
-                    "brand": card.brand,
-                    "last4": card.last4,
-                    "exp_month": card.exp_month,
-                    "exp_year": card.exp_year,
+                    "brand": card.get("brand"),
+                    "last4": card.get("last4"),
+                    "exp_month": card.get("exp_month"),
+                    "exp_year": card.get("exp_year"),
                 }
 
-            return {"type": payment_method.type}
+            return {"type": pm_type}
 
         except stripe.StripeError as e:
             logger.error(f"Error fetching payment method: {e}")
@@ -507,18 +526,20 @@ class StripeService:
                 limit=limit,
             )
 
-            return [
-                {
-                    "id": inv.id,
-                    "amount": inv.amount_paid,
-                    "currency": inv.currency,
-                    "status": inv.status,
-                    "created_at": datetime.fromtimestamp(inv.created).isoformat(),
-                    "invoice_url": inv.hosted_invoice_url,
-                    "invoice_pdf": inv.invoice_pdf,
-                }
-                for inv in invoices.data
-            ]
+            invoice_list = invoices.get("data", [])
+            result_list = []
+            for inv in invoice_list:
+                created = inv.get("created")
+                result_list.append({
+                    "id": inv.get("id"),
+                    "amount": inv.get("amount_paid"),
+                    "currency": inv.get("currency"),
+                    "status": inv.get("status"),
+                    "created_at": datetime.fromtimestamp(created).isoformat() if created else None,
+                    "invoice_url": inv.get("hosted_invoice_url"),
+                    "invoice_pdf": inv.get("invoice_pdf"),
+                })
+            return result_list
         except stripe.StripeError as e:
             logger.error(f"Error fetching invoices: {e}")
             return []
