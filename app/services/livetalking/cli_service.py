@@ -298,19 +298,44 @@ class LiveTalkingCLIService:
             - result_data: Dict with result info if successful
             - error_message: Error string if failed
         """
+        # FIRST: Check output file for final result
+        # This handles PID reuse - if output has result, process is done
+        # When a CLI process fails quickly, the PID gets freed and reused by
+        # another process. By checking output first, we detect completion
+        # regardless of what process currently has that PID.
+        output_data = self.read_process_output(output_file)
+
+        # If output indicates explicit failure, return immediately
+        if output_data and output_data.get("success") is False:
+            error_msg = output_data.get("error", "Avatar generation failed")
+            logger.info(f"Avatar {avatar_id} failed: {error_msg}")
+            return (True, output_data, error_msg)
+
+        # If output indicates success, verify avatar exists
+        if output_data and output_data.get("success") is True:
+            # Process completed successfully per output - verify avatar directory
+            livetalking_avatar_path = os.path.join(
+                self.livetalking_root, "data", "avatars", avatar_id
+            )
+            local_avatar_dir = self._get_avatar_local_dir(avatar_id)
+            avatar_exists = os.path.exists(livetalking_avatar_path) or os.path.exists(local_avatar_dir)
+
+            if avatar_exists:
+                frame_count = output_data.get("frame_count", 0)
+                check_path = local_avatar_dir if os.path.exists(local_avatar_dir) else livetalking_avatar_path
+                return (True, {
+                    "success": True,
+                    "avatar_id": avatar_id,
+                    "frame_count": frame_count,
+                    "avatar_path": check_path,
+                }, None)
+
+        # No definitive result in output - check if process is still running
         process_running = self.is_process_running(pid)
 
         if process_running:
-            # Still running
+            # Process still running, no result yet
             return (False, None, None)
-
-        # Process has finished - check results
-        output_data = self.read_process_output(output_file)
-
-        # Check if output indicates failure
-        if output_data and output_data.get("success") is False:
-            error_msg = output_data.get("error", "Avatar generation failed")
-            return (True, output_data, error_msg)
 
         # Check if avatar directory was created (indicates success)
         livetalking_avatar_path = os.path.join(
