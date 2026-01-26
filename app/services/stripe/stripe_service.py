@@ -521,12 +521,15 @@ class StripeService:
             return []
 
         try:
+            logger.info(f"Fetching invoices for customer {subscription.stripe_customer_id}")
             invoices = stripe.Invoice.list(
                 customer=subscription.stripe_customer_id,
                 limit=limit,
             )
 
             invoice_list = invoices.get("data", [])
+            logger.info(f"Found {len(invoice_list)} invoices for customer {subscription.stripe_customer_id}")
+
             result_list = []
             for inv in invoice_list:
                 created = inv.get("created")
