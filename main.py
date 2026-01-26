@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
@@ -35,11 +36,27 @@ from app.routers import (
     avatar_router,
     avatar_backend_router,
 )
+from app.services.scheduler import scheduler_service
 
 # Initialize Sentry for error tracking (only in non-debug environments)
 sentry_enabled = configure_sentry()
 if sentry_enabled:
     logger.info("Sentry error tracking initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler for startup/shutdown events."""
+    # Startup
+    logger.info("Starting background scheduler...")
+    await scheduler_service.start()
+
+    yield
+
+    # Shutdown
+    logger.info("Stopping background scheduler...")
+    await scheduler_service.stop()
+
 
 app = FastAPI(
     title="Video Clone Backend",
@@ -47,6 +64,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url=None,
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # CORS configuration - allow all origins
@@ -114,7 +132,11 @@ async def health_check(db: AsyncSession = Depends(get_db)):
         logger.error(f"Database health check failed: {e}")
         db_status = "disconnected"
 
-    return {"status": "healthy", "database": db_status}
+    return {
+        "status": "healthy",
+        "database": db_status,
+        "scheduler": "running" if scheduler_service._running else "stopped",
+    }
 
 
 if __name__ == "__main__":

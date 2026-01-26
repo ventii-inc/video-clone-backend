@@ -48,6 +48,7 @@ Optional environment variables:
 - `LIVETALKING_ROOT`, `LIVETALKING_VENV`, `LIVETALKING_MODE` - LiveTalking avatar generation (cli/api/auto)
 - `AVATAR_API_KEY` - API key for backend-to-backend avatar endpoints
 - `AVATAR_MAX_CONCURRENT` - Max concurrent avatar generation jobs (default: 3)
+- `AVATAR_JOB_CHECK_INTERVAL` - Interval in seconds for background job status checks (default: 10)
 
 ## Architecture
 
@@ -74,6 +75,7 @@ Optional environment variables:
 - `fish_audio/` - Voice cloning and TTS via Fish Audio API
 - `livetalking/` - Avatar generation via CLI subprocess or RunPod API
 - `avatar_job/` - Avatar generation job queue with concurrency control
+- `scheduler/` - Background task scheduler for periodic job status checks
 - `video/` - Video generation orchestration
 - `audio/` - Audio processing utilities
 - `progress/` - Progress tracking for long-running operations
