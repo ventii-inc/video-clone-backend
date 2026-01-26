@@ -307,6 +307,11 @@ class LiveTalkingCLIService:
         # Process has finished - check results
         output_data = self.read_process_output(output_file)
 
+        # Check if output indicates failure
+        if output_data and output_data.get("success") is False:
+            error_msg = output_data.get("error", "Avatar generation failed")
+            return (True, output_data, error_msg)
+
         # Check if avatar directory was created (indicates success)
         livetalking_avatar_path = os.path.join(
             self.livetalking_root, "data", "avatars", avatar_id
