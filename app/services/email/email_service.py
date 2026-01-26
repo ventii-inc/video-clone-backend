@@ -218,6 +218,32 @@ class EmailService:
             logger.error(f"Error sending training completion email to {to_email}: {str(e)}")
             return False
 
+    def _get_user_friendly_error_message(self, error_message: Optional[str]) -> Optional[str]:
+        """
+        Convert technical error messages to user-friendly Japanese messages.
+
+        Args:
+            error_message: Technical error message from the system
+
+        Returns:
+            User-friendly Japanese error message, or None if no message
+        """
+        if not error_message:
+            return None
+
+        error_lower = error_message.lower()
+
+        # Face detection errors
+        if "face not detected" in error_lower or "face" in error_lower:
+            return (
+                "動画内で顔が検出できないフレームがありました。\n"
+                "アバターの学習には、全てのフレームで顔がはっきりと映っている必要があります。\n"
+                "顔が常に正面を向いており、十分な明るさがある動画をお試しください。"
+            )
+
+        # Generic fallback
+        return "トレーニング中に予期しないエラーが発生しました。別の動画でお試しください。"
+
     async def send_training_failure_email(
         self,
         to_email: str,
@@ -236,12 +262,14 @@ class EmailService:
         model_type_display = "ビデオアバター" if data.model_type == "video" else "ボイスモデル"
         subject = f"{model_type_display}のトレーニングが失敗しました"
 
+        # Convert technical error to user-friendly message
+        user_friendly_error = self._get_user_friendly_error_message(data.error_message)
+
         error_section = ""
-        if data.error_message:
+        if user_friendly_error:
             error_section = f"""
                 <div class="error-message">
-                    <strong>エラー内容:</strong><br>
-                    {data.error_message}
+                    {user_friendly_error.replace(chr(10), "<br>")}
                 </div>
             """
 
