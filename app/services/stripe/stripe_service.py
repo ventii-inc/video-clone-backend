@@ -53,6 +53,7 @@ class StripeService:
             email=user.email,
             name=user.name,
             metadata={"user_id": str(user.id)},
+            preferred_locales=["ja"],
         )
 
         # Create or update subscription record with customer ID
