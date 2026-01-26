@@ -239,7 +239,7 @@ class StripeService:
             return
 
         logger.info(f"Retrieving Stripe subscription {subscription_id} for user {user_id}")
-        stripe_subscription = stripe.Subscription.retrieve(subscription_id)
+        stripe_subscription = stripe.Subscription.retrieve(subscription_id, expand=["items"])
 
         result = await db.execute(
             select(Subscription).where(Subscription.user_id == user_id)
@@ -250,16 +250,18 @@ class StripeService:
             logger.error(f"No subscription record found for user {user_id}")
             return
 
-        # Use direct dict access for stripe_subscription (from stripe.Subscription.retrieve)
-        subscription.stripe_subscription_id = stripe_subscription["id"]
+        # Get billing period from first subscription item (Stripe 2025-03-31+ deprecates subscription-level periods)
+        first_item = stripe_subscription.items.data[0]
+
+        subscription.stripe_subscription_id = stripe_subscription.id
         subscription.plan_type = PlanType.STANDARD.value
         subscription.status = SubscriptionStatus.ACTIVE.value
         subscription.monthly_minutes_limit = stripe_settings.subscription_monthly_minutes
         subscription.current_period_start = datetime.fromtimestamp(
-            stripe_subscription["current_period_start"]
+            first_item.current_period_start
         )
         subscription.current_period_end = datetime.fromtimestamp(
-            stripe_subscription["current_period_end"]
+            first_item.current_period_end
         )
         subscription.canceled_at = None
 
