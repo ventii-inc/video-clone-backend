@@ -60,9 +60,6 @@ class StripeService:
             subscription = Subscription(
                 user_id=user.id,
                 stripe_customer_id=customer.id,
-                plan_type=PlanType.FREE.value,
-                status=SubscriptionStatus.ACTIVE.value,
-                monthly_minutes_limit=0,
             )
             db.add(subscription)
         else:
