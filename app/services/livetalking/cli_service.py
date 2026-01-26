@@ -24,7 +24,7 @@ from app.services.video import get_video_duration
 logger = logging.getLogger(__name__)
 
 # Frame limits for avatar generation
-MAX_FRAMES_DEFAULT = 1000  # For normal avatars (with speech)
+MAX_FRAMES_DEFAULT = 1800  # For normal avatars (~1 min at 30fps)
 MAX_FRAMES_SILENT = 100    # For silent/idle avatars
 
 
