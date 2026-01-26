@@ -239,7 +239,7 @@ class StripeService:
             return
 
         logger.info(f"Retrieving Stripe subscription {subscription_id} for user {user_id}")
-        stripe_subscription = stripe.Subscription.retrieve(subscription_id, expand=["items"])
+        stripe_subscription = stripe.Subscription.retrieve(subscription_id)
 
         result = await db.execute(
             select(Subscription).where(Subscription.user_id == user_id)
@@ -250,19 +250,27 @@ class StripeService:
             logger.error(f"No subscription record found for user {user_id}")
             return
 
-        # Get billing period from first subscription item (Stripe 2025-03-31+ deprecates subscription-level periods)
-        first_item = stripe_subscription.items.data[0]
+        # Get billing period - try subscription level first, fallback to items
+        # (Stripe 2025-03-31+ moved these to items, but older API versions have them on subscription)
+        period_start = stripe_subscription.get("current_period_start")
+        period_end = stripe_subscription.get("current_period_end")
 
-        subscription.stripe_subscription_id = stripe_subscription.id
+        # If not on subscription level, get from items (use dict access to avoid .items() method conflict)
+        if not period_start:
+            items_data = stripe_subscription.get("items", {}).get("data", [])
+            if items_data:
+                first_item = items_data[0]
+                period_start = first_item.get("current_period_start")
+                period_end = first_item.get("current_period_end")
+
+        subscription.stripe_subscription_id = stripe_subscription.get("id")
         subscription.plan_type = PlanType.STANDARD.value
         subscription.status = SubscriptionStatus.ACTIVE.value
         subscription.monthly_minutes_limit = stripe_settings.subscription_monthly_minutes
-        subscription.current_period_start = datetime.fromtimestamp(
-            first_item.current_period_start
-        )
-        subscription.current_period_end = datetime.fromtimestamp(
-            first_item.current_period_end
-        )
+        if period_start:
+            subscription.current_period_start = datetime.fromtimestamp(period_start)
+        if period_end:
+            subscription.current_period_end = datetime.fromtimestamp(period_end)
         subscription.canceled_at = None
 
         await db.commit()
