@@ -20,7 +20,7 @@ from app.models.video_model import ModelStatus, ProcessingStage
 from app.services.avatar_job.runpod_client import runpod_client
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
-from app.services.email import TrainingCompletionData, get_email_service
+from app.services.email import TrainingCompletionData, TrainingFailureData, get_email_service
 from app.services.progress import update_video_model_progress
 from app.services.s3 import s3_service
 from app.utils import logger
@@ -704,7 +704,29 @@ class AvatarJobService:
             video_model.processing_stage = ProcessingStage.FAILED.value
             # Keep current progress_percent to show where it failed
 
+        # Fetch user for email notification
+        user_result = await db.execute(select(User).where(User.id == job.user_id))
+        user = user_result.scalar_one_or_none()
+
         await db.commit()
+
+        # Send training failure email
+        if user and user.email:
+            try:
+                email_service = get_email_service()
+                await email_service.send_training_failure_email(
+                    to_email=user.email,
+                    data=TrainingFailureData(
+                        user_name=user.name or "there",
+                        model_name=video_model.name if video_model else "Your Avatar",
+                        model_type="video",
+                        error_message=error_message,
+                        dashboard_url=None,
+                    ),
+                )
+                logger.info(f"Sent failure email to {user.email} for job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to send failure email for job {job_id}: {e}")
 
         logger.error(f"Job {job_id} failed: {error_message}")
 
