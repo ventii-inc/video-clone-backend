@@ -23,6 +23,15 @@ Usage:
 
     # Show recent activity (last N items)
     ENV=staging uv run python scripts/check_status.py models --recent 5
+
+    # Show job output logs (most recent job)
+    ENV=staging uv run python scripts/check_status.py logs
+
+    # Show logs for specific job
+    ENV=staging uv run python scripts/check_status.py logs --id <uuid>
+
+    # Show all lines (not just last 100)
+    ENV=staging uv run python scripts/check_status.py logs --tail 0
 """
 
 import argparse
@@ -228,11 +237,83 @@ def list_avatar_jobs(
         print(f"  User Email: {user.email}")
         print(f"  Video Model Name: {video_model.name}")
         print(f"  RunPod Job ID: {job.runpod_job_id or '-'}")
+        print(f"  PID: {job.pid or '-'}")
+        print(f"  Output File: {job.output_file or '-'}")
         print(f"  Started At: {format_datetime(job.started_at)}")
         print(f"  Completed At: {format_datetime(job.completed_at)}")
         print(f"  Avatar S3 Key: {job.avatar_s3_key or '-'}")
         if job.error_message:
             print(f"  Error Message: {job.error_message}")
+
+
+def show_job_logs(
+    db: Session,
+    job_id: Optional[str] = None,
+    tail: int = 100,
+):
+    """Show logs for a job's output file."""
+    query = (
+        select(AvatarJob, VideoModel, User)
+        .join(VideoModel, AvatarJob.video_model_id == VideoModel.id)
+        .join(User, AvatarJob.user_id == User.id)
+    )
+
+    if job_id:
+        try:
+            uuid_id = UUID(job_id)
+            query = query.where(AvatarJob.id == uuid_id)
+        except ValueError:
+            print(f"Error: Invalid UUID format: {job_id}")
+            return
+    else:
+        # Get most recent job with an output file
+        query = query.where(AvatarJob.output_file.isnot(None))
+        query = query.order_by(AvatarJob.created_at.desc()).limit(1)
+
+    result = db.execute(query).first()
+
+    if not result:
+        print("No job found matching criteria.")
+        return
+
+    job, video_model, user = result
+
+    print(f"\nJob: {job.id}")
+    print(f"Model: {video_model.name}")
+    print(f"User: {user.email}")
+    print(f"Status: {job.status}")
+    print(f"PID: {job.pid or '-'}")
+    print(f"Output File: {job.output_file or '-'}")
+    print("=" * 80)
+
+    if not job.output_file:
+        print("No output file path recorded for this job.")
+        return
+
+    # Read the output file
+    output_path = Path(job.output_file)
+    if not output_path.exists():
+        print(f"Output file not found: {job.output_file}")
+        return
+
+    try:
+        with open(output_path, "r") as f:
+            content = f.read()
+
+        if not content:
+            print("(empty file)")
+            return
+
+        lines = content.splitlines()
+        if tail and len(lines) > tail:
+            print(f"(showing last {tail} lines, total {len(lines)} lines)\n")
+            lines = lines[-tail:]
+
+        for line in lines:
+            print(line)
+
+    except Exception as e:
+        print(f"Error reading output file: {e}")
 
 
 def main():
@@ -294,6 +375,21 @@ def main():
         help="Show only the N most recent items",
     )
 
+    # Logs subcommand
+    logs_parser = subparsers.add_parser("logs", help="Show job output logs")
+    logs_parser.add_argument(
+        "--id",
+        type=str,
+        dest="job_id",
+        help="Show logs for specific job (default: most recent job with output)",
+    )
+    logs_parser.add_argument(
+        "--tail",
+        type=int,
+        default=100,
+        help="Number of lines to show (default: 100, use 0 for all)",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -322,6 +418,12 @@ def main():
                 email=args.email,
                 job_id=args.job_id,
                 recent=args.recent,
+            )
+        elif args.command == "logs":
+            show_job_logs(
+                db,
+                job_id=args.job_id,
+                tail=args.tail,
             )
 
     except Exception as e:

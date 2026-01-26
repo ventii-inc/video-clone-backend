@@ -15,6 +15,9 @@ Usage:
     # Reset failed jobs and process all
     ENV=staging uv run python scripts/process_avatar_jobs.py --reset-failed
 
+    # Reset stuck processing jobs to failed
+    ENV=staging uv run python scripts/process_avatar_jobs.py --reset-processing
+
     # Show queue status only (no processing)
     ENV=staging uv run python scripts/process_avatar_jobs.py --status
 
@@ -150,6 +153,68 @@ async def reset_failed_jobs():
         await db.commit()
         print(f"Reset {failed_count} failed job(s) to pending")
         return failed_count
+
+
+async def reset_processing_jobs():
+    """Force reset all processing jobs to failed status."""
+    from datetime import datetime
+
+    from sqlalchemy import func, select, update
+
+    from app.db import get_db_session
+    from app.models import AvatarJob, VideoModel
+    from app.models.avatar_job import JobStatus
+    from app.models.video_model import ModelStatus, ProcessingStage
+
+    async with get_db_session() as db:
+        # Get count of processing jobs
+        result = await db.execute(
+            select(func.count()).where(AvatarJob.status == JobStatus.PROCESSING.value)
+        )
+        processing_count = result.scalar()
+
+        if processing_count == 0:
+            print("No processing jobs to reset")
+            return 0
+
+        # Get job IDs and video model IDs before resetting
+        result = await db.execute(
+            select(AvatarJob.id, AvatarJob.video_model_id).where(
+                AvatarJob.status == JobStatus.PROCESSING.value
+            )
+        )
+        jobs = result.fetchall()
+
+        # Reset processing jobs to failed
+        await db.execute(
+            update(AvatarJob)
+            .where(AvatarJob.status == JobStatus.PROCESSING.value)
+            .values(
+                status=JobStatus.FAILED.value,
+                error_message="Force reset - job was stuck in processing",
+                completed_at=datetime.utcnow(),
+                pid=None,
+                output_file=None,
+            )
+        )
+
+        # Update corresponding video models
+        model_ids = [job[1] for job in jobs]
+        if model_ids:
+            await db.execute(
+                update(VideoModel)
+                .where(VideoModel.id.in_(model_ids))
+                .values(
+                    status=ModelStatus.FAILED.value,
+                    error_message="Force reset - job was stuck in processing",
+                    processing_stage=ProcessingStage.FAILED.value,
+                    processing_completed_at=datetime.utcnow(),
+                )
+            )
+
+        await db.commit()
+        print(f"Reset {processing_count} processing job(s) to failed")
+        return processing_count
 
 
 async def reset_specific_job(job_id: UUID):
@@ -348,6 +413,11 @@ async def main():
         help="Reset all failed jobs to pending before processing",
     )
     parser.add_argument(
+        "--reset-processing",
+        action="store_true",
+        help="Force reset all processing jobs to failed status (use when jobs are stuck)",
+    )
+    parser.add_argument(
         "--job-id",
         type=str,
         help="Reset and process a specific job by ID",
@@ -400,6 +470,14 @@ async def main():
     if args.check_running:
         print("\nChecking running jobs for completion...")
         await check_running_jobs()
+        print("\nFinal status:")
+        await show_status()
+        return
+
+    # Reset stuck processing jobs
+    if args.reset_processing:
+        print("\nForce resetting stuck processing jobs...")
+        await reset_processing_jobs()
         print("\nFinal status:")
         await show_status()
         return
