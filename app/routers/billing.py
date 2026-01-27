@@ -11,6 +11,7 @@ import stripe
 
 from app.db import get_db
 from app.models import User, Subscription
+from app.models.subscription import SubscriptionStatus
 from app.services.firebase import get_current_user
 from app.services.stripe import stripe_service, stripe_settings
 
@@ -53,10 +54,11 @@ async def get_subscription(
     if subscription and subscription.stripe_customer_id:
         payment_method = await stripe_service.get_default_payment_method(user, db)
 
-    if not subscription:
+    # Treat incomplete subscriptions as non-existent (customer created but no payment)
+    if not subscription or subscription.status == SubscriptionStatus.INCOMPLETE.value:
         return {
             "subscription": None,
-            "payment_method": None,
+            "payment_method": payment_method,
         }
 
     return {

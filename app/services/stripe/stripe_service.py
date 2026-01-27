@@ -57,10 +57,12 @@ class StripeService:
         )
 
         # Create or update subscription record with customer ID
+        # Status is INCOMPLETE until payment is confirmed via webhook
         if not subscription:
             subscription = Subscription(
                 user_id=user.id,
                 stripe_customer_id=customer.id,
+                status=SubscriptionStatus.INCOMPLETE.value,
             )
             db.add(subscription)
         else:

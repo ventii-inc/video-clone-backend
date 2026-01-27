@@ -17,6 +17,7 @@ class PlanType(str, PyEnum):
 
 
 class SubscriptionStatus(str, PyEnum):
+    INCOMPLETE = "incomplete"  # Customer created but no payment completed
     ACTIVE = "active"
     CANCELED = "canceled"
     PAST_DUE = "past_due"
@@ -33,7 +34,7 @@ class Subscription(Base):
     stripe_customer_id = Column(String(100), nullable=True, index=True)
     stripe_subscription_id = Column(String(100), nullable=True, index=True)
     plan_type = Column(String(20), default=PlanType.FREE.value, nullable=False)
-    status = Column(String(20), default=SubscriptionStatus.ACTIVE.value, nullable=False)
+    status = Column(String(20), default=SubscriptionStatus.INCOMPLETE.value, nullable=False)
     monthly_minutes_limit = Column(Integer, default=0, nullable=False)  # 0 for free, 100 for standard
     current_period_start = Column(DateTime, nullable=True)
     current_period_end = Column(DateTime, nullable=True)

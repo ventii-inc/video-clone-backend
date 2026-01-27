@@ -51,6 +51,34 @@ ENV=staging uv run python scripts/check_status.py jobs --id <uuid>
 ENV=staging uv run python scripts/check_status.py logs
 ```
 
+## Reset & Retry Commands
+
+```bash
+# Show job queue status
+ENV=staging uv run python scripts/process_avatar_jobs.py --status
+
+# Reset stuck processing jobs to failed (use when jobs are stuck)
+ENV=staging uv run python scripts/process_avatar_jobs.py --reset-processing
+
+# Reset all failed jobs to pending and reprocess
+ENV=staging uv run python scripts/process_avatar_jobs.py --reset-failed
+
+# Reset and process a specific job by ID
+ENV=staging uv run python scripts/process_avatar_jobs.py --job-id <uuid>
+
+# Check running jobs for completion (poll detached processes)
+ENV=staging uv run python scripts/process_avatar_jobs.py --check-running
+
+# Recover stuck uploads (retry S3 upload)
+ENV=staging uv run python scripts/process_avatar_jobs.py --recover-uploads
+
+# Process all pending jobs
+ENV=staging uv run python scripts/process_avatar_jobs.py
+
+# Run as daemon (checks every 30 seconds)
+ENV=staging uv run python scripts/process_avatar_jobs.py --daemon --interval 30
+```
+
 ## LiveTalking Logs (on server)
 
 ```bash
