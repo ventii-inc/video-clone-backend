@@ -13,12 +13,9 @@ from app.schemas.profile import (
     ProfileUpdate,
 )
 from app.schemas.video_model import (
-    VideoModelCreate,
     VideoModelResponse,
     VideoModelListResponse,
     VideoModelUpdate,
-    UploadCompleteRequest,
-    UploadInfo,
     DirectUploadResponse,
 )
 from app.schemas.voice_model import (
@@ -69,12 +66,9 @@ __all__ = [
     "ProfileResponse",
     "ProfileUpdate",
     # Video Model
-    "VideoModelCreate",
     "VideoModelResponse",
     "VideoModelListResponse",
     "VideoModelUpdate",
-    "UploadCompleteRequest",
-    "UploadInfo",
     "DirectUploadResponse",
     # Voice Model
     "VoiceModelCreate",

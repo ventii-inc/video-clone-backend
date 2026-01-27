@@ -5,29 +5,16 @@ from uuid import UUID
 from typing import Literal
 from pydantic import BaseModel, Field
 
-from app.schemas.common import UploadInfo, PaginationMeta
+from app.schemas.common import PaginationMeta
 
 
 ModelStatus = Literal["pending", "uploading", "processing", "completed", "failed"]
 ProcessingStage = Literal["pending", "uploading", "preparing", "training", "finalizing", "completed", "failed"]
 
 
-class VideoModelCreate(BaseModel):
-    """Video model creation request"""
-    name: str = Field(..., min_length=1, max_length=100)
-    file_name: str = Field(..., description="Original file name with extension")
-    file_size_bytes: int = Field(..., gt=0, le=524288000, description="Max 500MB")
-    content_type: str = Field(..., description="MIME type (video/mp4, etc.)")
-
-
 class VideoModelUpdate(BaseModel):
     """Video model update request"""
     name: str = Field(..., min_length=1, max_length=100)
-
-
-class UploadCompleteRequest(BaseModel):
-    """Request to mark upload as complete"""
-    duration_seconds: int = Field(..., gt=0, description="Video duration in seconds")
 
 
 class AvatarReadyRequest(BaseModel):
@@ -69,12 +56,6 @@ class VideoModelBrief(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class VideoModelCreateResponse(BaseModel):
-    """Response when creating a video model"""
-    model: VideoModelBrief
-    upload: UploadInfo
 
 
 class VideoModelListResponse(BaseModel):
