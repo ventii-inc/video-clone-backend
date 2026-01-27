@@ -67,8 +67,12 @@ async def list_voice_models(
     if source_type:
         query = query.where(VoiceModel.source_type == source_type)
 
-    # Get total count
-    count_query = select(func.count()).select_from(query.subquery())
+    # Get total count - build count query directly with same filters (more efficient)
+    count_query = select(func.count(VoiceModel.id)).where(VoiceModel.user_id == user.id)
+    if status:
+        count_query = count_query.where(VoiceModel.status == status)
+    if source_type:
+        count_query = count_query.where(VoiceModel.source_type == source_type)
     total_result = await db.execute(count_query)
     total = total_result.scalar()
 
@@ -497,8 +501,12 @@ async def delete_voice_model(
             detail="Voice model not found",
         )
 
-    # Check if model has generated videos
-    if model.generated_videos and len(model.generated_videos) > 0:
+    # Check if model has generated videos (use count query to avoid lazy loading)
+    from app.models import GeneratedVideo
+    video_count_result = await db.execute(
+        select(func.count(GeneratedVideo.id)).where(GeneratedVideo.voice_model_id == model_id)
+    )
+    if video_count_result.scalar() > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete model that has generated videos",

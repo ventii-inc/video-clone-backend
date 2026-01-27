@@ -69,9 +69,11 @@ async def list_video_models(
     if status:
         query = query.where(VideoModel.status == status)
 
-    # Get total count
+    # Get total count - build count query directly with same filters (more efficient)
     t0 = time.perf_counter()
-    count_query = select(func.count()).select_from(query.subquery())
+    count_query = select(func.count(VideoModel.id)).where(VideoModel.user_id == user.id)
+    if status:
+        count_query = count_query.where(VideoModel.status == status)
     total_result = await db.execute(count_query)
     total = total_result.scalar()
     timings["count_query"] = (time.perf_counter() - t0) * 1000
@@ -85,22 +87,36 @@ async def list_video_models(
     models = result.scalars().all()
     timings["main_query"] = (time.perf_counter() - t0) * 1000
 
-    # Generate presigned URLs for thumbnails
+    # Generate presigned URLs for thumbnails in parallel
     t0 = time.perf_counter()
+
+    # Create briefs first without URLs
     model_briefs = []
-    thumbnail_timings = []
-    for m in models:
+    models_with_thumbnails = []
+    for i, m in enumerate(models):
         brief = VideoModelBrief.model_validate(m)
-        # Map internal status to public status (pending/uploading → processing)
         brief.status = map_public_status(m.status)
-        # Generate thumbnail URL from thumbnail_key if available
-        if m.thumbnail_key:
-            t_thumb = time.perf_counter()
-            brief.thumbnail_url = await s3_service.generate_presigned_url(m.thumbnail_key)
-            thumbnail_timings.append((time.perf_counter() - t_thumb) * 1000)
         model_briefs.append(brief)
+        if m.thumbnail_key:
+            models_with_thumbnails.append((i, m.thumbnail_key))
+
+    # Generate all presigned URLs in parallel
+    if models_with_thumbnails:
+        thumbnail_tasks = [
+            s3_service.generate_presigned_url(key)
+            for _, key in models_with_thumbnails
+        ]
+        thumbnail_urls = await asyncio.gather(*thumbnail_tasks, return_exceptions=True)
+
+        # Assign URLs back to briefs
+        for (idx, _), url in zip(models_with_thumbnails, thumbnail_urls):
+            if isinstance(url, str):  # Not an exception
+                model_briefs[idx].thumbnail_url = url
+            else:
+                logger.warning(f"Failed to generate presigned URL: {url}")
+
     timings["presigned_urls_total"] = (time.perf_counter() - t0) * 1000
-    timings["presigned_urls_individual"] = thumbnail_timings
+    timings["presigned_urls_count"] = len(models_with_thumbnails)
 
     timings["total"] = (time.perf_counter() - total_start) * 1000
 
@@ -109,7 +125,7 @@ async def list_video_models(
         f"count_query={timings['count_query']:.1f}ms, "
         f"main_query={timings['main_query']:.1f}ms, "
         f"presigned_urls_total={timings['presigned_urls_total']:.1f}ms "
-        f"(count={len(thumbnail_timings)}, each={thumbnail_timings if thumbnail_timings else 'N/A'}), "
+        f"(count={timings['presigned_urls_count']}, parallel), "
         f"TOTAL={timings['total']:.1f}ms"
     )
 
@@ -741,8 +757,12 @@ async def delete_video_model(
             detail="Video model not found",
         )
 
-    # Check if model has generated videos
-    if model.generated_videos and len(model.generated_videos) > 0:
+    # Check if model has generated videos (use count query to avoid lazy loading)
+    from app.models import GeneratedVideo
+    video_count_result = await db.execute(
+        select(func.count(GeneratedVideo.id)).where(GeneratedVideo.video_model_id == model_id)
+    )
+    if video_count_result.scalar() > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete model that has generated videos",
