@@ -13,6 +13,73 @@ logger = logging.getLogger(__name__)
 # Maximum duration for training videos (in seconds)
 MAX_TRAINING_VIDEO_DURATION = 60
 
+# Target FPS for training videos
+TARGET_TRAINING_FPS = 25
+
+
+async def get_video_info(file_path: str) -> Optional[dict]:
+    """
+    Get video information (duration, fps) using ffprobe.
+
+    Args:
+        file_path: Path to the video file
+
+    Returns:
+        Dict with 'duration' and 'fps' keys, or None if unable to determine
+    """
+    if not os.path.exists(file_path):
+        logger.error(f"Video file not found: {file_path}")
+        return None
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            "-select_streams", "v:0",
+            file_path,
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"ffprobe failed: {stderr.decode()}")
+            return None
+
+        data = json.loads(stdout.decode())
+        duration = float(data["format"]["duration"])
+
+        # Get FPS from video stream
+        fps = None
+        if data.get("streams"):
+            stream = data["streams"][0]
+            # Try r_frame_rate first (real frame rate), then avg_frame_rate
+            frame_rate = stream.get("r_frame_rate") or stream.get("avg_frame_rate")
+            if frame_rate and "/" in frame_rate:
+                num, den = frame_rate.split("/")
+                if int(den) != 0:
+                    fps = int(num) / int(den)
+
+        logger.info(f"Video info: duration={duration:.2f}s, fps={fps} for {file_path}")
+        return {"duration": duration, "fps": fps}
+
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.error(f"Failed to parse ffprobe output: {e}")
+        return None
+    except FileNotFoundError:
+        logger.error("ffprobe not found. Please install FFmpeg.")
+        return None
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+        return None
+
 
 async def get_video_duration(file_path: str) -> Optional[float]:
     """
@@ -213,6 +280,7 @@ class VideoService:
 
     def __init__(self):
         self.max_training_duration = MAX_TRAINING_VIDEO_DURATION
+        self.target_fps = TARGET_TRAINING_FPS
 
     async def process_training_video(
         self,
@@ -220,39 +288,95 @@ class VideoService:
         output_path: Optional[str] = None,
     ) -> tuple[str, float, bool]:
         """
-        Process a training video: trim if necessary.
+        Process a training video: trim to max duration, convert to 25fps, remove audio.
 
         Args:
             input_path: Path to the input video
             output_path: Optional path for output (defaults to temp file)
 
         Returns:
-            Tuple of (output_path, duration_seconds, was_trimmed)
+            Tuple of (output_path, duration_seconds, was_processed)
 
         Raises:
             ValueError: If video cannot be processed
         """
-        duration = await get_video_duration(input_path)
+        video_info = await get_video_info(input_path)
 
-        if duration is None:
-            raise ValueError(f"Could not determine video duration: {input_path}")
+        if video_info is None:
+            raise ValueError(f"Could not determine video info: {input_path}")
 
-        # If video is short enough, no processing needed
-        if duration <= self.max_training_duration:
-            return input_path, duration, False
+        duration = video_info["duration"]
+        current_fps = video_info.get("fps")
+
+        # Check what processing is needed
+        needs_trim = duration > self.max_training_duration
+        needs_fps_convert = current_fps is None or abs(current_fps - self.target_fps) > 0.5
+        # Always process to ensure audio is removed
 
         # Generate output path if not provided
         if output_path is None:
             base, ext = os.path.splitext(input_path)
-            output_path = f"{base}_trimmed{ext}"
+            output_path = f"{base}_processed{ext}"
 
-        # Trim the video
-        success = await trim_video(input_path, output_path, self.max_training_duration)
+        # Build ffmpeg command for processing
+        # Always re-encode since we need fps conversion and/or audio removal
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-i", input_path,
+        ]
 
-        if not success:
-            raise ValueError(f"Failed to trim video: {input_path}")
+        # Add duration limit if needed
+        if needs_trim:
+            cmd.extend(["-t", str(self.max_training_duration)])
 
-        return output_path, float(self.max_training_duration), True
+        # Add video filter for FPS conversion
+        cmd.extend(["-vf", f"fps={self.target_fps}"])
+
+        # Remove audio
+        cmd.append("-an")
+
+        # Output settings
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            output_path,
+        ])
+
+        logger.info(
+            f"Processing video: trim={needs_trim}, fps_convert={needs_fps_convert}, remove_audio=True "
+            f"(duration: {duration:.2f}s, current_fps: {current_fps}, target_fps: {self.target_fps})"
+        )
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                logger.error(f"FFmpeg processing failed: {stderr.decode()}")
+                raise ValueError(f"Failed to process video: {input_path}")
+
+            # Verify output file exists
+            if not os.path.exists(output_path):
+                raise ValueError(f"Processed video not created: {output_path}")
+
+            # Calculate final duration
+            final_duration = min(duration, float(self.max_training_duration)) if needs_trim else duration
+
+            logger.info(f"Video processed successfully: {output_path} ({final_duration:.2f}s, {self.target_fps}fps)")
+            return output_path, final_duration, True
+
+        except FileNotFoundError:
+            raise ValueError("ffmpeg not found. Please install FFmpeg.")
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Error processing video: {e}")
 
     @staticmethod
     def is_ffmpeg_available() -> bool:
