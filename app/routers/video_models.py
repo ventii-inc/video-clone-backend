@@ -229,39 +229,18 @@ async def direct_upload_video(
     await db.commit()
     await db.refresh(model)
 
-    # Save file to temp location first
+    # Save raw file locally (processing happens in background)
     settings = LiveTalkingSettings()
     Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
 
     ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-    temp_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_temp{ext}")
-    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}{ext}")
+    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
 
-    with open(temp_path, "wb") as f:
+    with open(local_path, "wb") as f:
         f.write(content)
 
-    logger.info(f"Saved temp video: {temp_path}")
-
-    # Process video (trim to 60s, convert to 25fps, remove audio)
-    try:
-        _, processed_duration, _ = await video_service.process_training_video(temp_path, local_path)
-        model.duration_seconds = int(processed_duration)
-        model.file_size_bytes = os.path.getsize(local_path)
-        logger.info(f"Processed video: {local_path} (duration: {processed_duration:.2f}s)")
-    except ValueError as e:
-        # Clean up temp file and fail
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to process video: {str(e)}",
-        )
-    finally:
-        # Clean up temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
     model.local_video_path = local_path
+    logger.info(f"Saved raw video: {local_path}")
 
     # Generate S3 key for the video
     s3_key = s3_service.generate_s3_key(
@@ -305,17 +284,57 @@ async def process_upload_background_tasks(
     s3_key: str,
 ):
     """
-    Background task to upload video to S3, generate thumbnail, and trigger avatar processing.
+    Background task to process video, upload to S3, generate thumbnail, and trigger avatar processing.
 
-    If this task crashes (e.g., server restart), the recovery script will retry
-    stuck uploads by checking for models with status='uploading' and local_video_path set.
+    Flow:
+    1. Process video (trim 60s, 25fps, remove audio)
+    2. In parallel: upload to S3, generate thumbnail, trigger avatar processing
     """
     from app.db import get_db_session
 
+    # Step 1: Process video first (required before S3 upload and avatar training)
+    raw_path = local_path  # local_path is the raw file
+    processed_path = local_path.replace("_raw", "")  # Remove _raw suffix for processed file
+
+    try:
+        _, processed_duration, _ = await video_service.process_training_video(raw_path, processed_path)
+        logger.info(f"Processed video: {processed_path} (duration: {processed_duration:.2f}s)")
+
+        # Update model with processed info
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.duration_seconds = int(processed_duration)
+                model.file_size_bytes = os.path.getsize(processed_path)
+                model.local_video_path = processed_path  # Update to processed path
+                await db.commit()
+
+        # Clean up raw file
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+    except Exception as e:
+        logger.error(f"Video processing failed for model {model_id}: {e}")
+        # Mark model as failed
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Video processing failed: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 2: Run S3 upload, thumbnail generation, and avatar processing in parallel
     async def upload_to_s3():
-        """Upload the local video file to S3."""
+        """Upload the processed video file to S3."""
         try:
-            success = await s3_service.upload_file(local_path, s3_key)
+            success = await s3_service.upload_file(processed_path, s3_key)
             if success:
                 logger.info(f"S3 upload complete: {s3_key}")
                 async with get_db_session() as db:
@@ -332,15 +351,13 @@ async def process_upload_background_tasks(
             logger.error(f"S3 upload error for model {model_id}: {e}")
 
     async def generate_and_upload_thumbnail():
-        """Extract thumbnail from video and upload to S3."""
+        """Extract thumbnail from processed video and upload to S3."""
         try:
-            # Extract thumbnail from video
-            thumbnail_path = await extract_thumbnail(local_path, timestamp=1.0)
+            thumbnail_path = await extract_thumbnail(processed_path, timestamp=1.0)
             if not thumbnail_path:
                 logger.warning(f"Failed to extract thumbnail for model {model_id}")
                 return
 
-            # Generate S3 key for thumbnail
             thumbnail_s3_key = s3_service.generate_s3_key(
                 user_id=str(user_id),
                 filename=f"{model_id}.jpg",
@@ -348,14 +365,12 @@ async def process_upload_background_tasks(
                 unique_id=str(model_id),
             )
 
-            # Upload thumbnail to S3
             success = await s3_service.upload_file(
                 thumbnail_path, thumbnail_s3_key, content_type="image/jpeg"
             )
 
             if success:
                 logger.info(f"Thumbnail uploaded: {thumbnail_s3_key}")
-                # Update model with thumbnail key
                 async with get_db_session() as db:
                     result = await db.execute(
                         select(VideoModel).where(VideoModel.id == model_id)
@@ -367,7 +382,6 @@ async def process_upload_background_tasks(
             else:
                 logger.error(f"Thumbnail upload failed: {thumbnail_s3_key}")
 
-            # Clean up temp thumbnail file
             if thumbnail_path and os.path.exists(thumbnail_path):
                 os.remove(thumbnail_path)
 
@@ -382,7 +396,6 @@ async def process_upload_background_tasks(
         except Exception as e:
             logger.error(f"Avatar processing trigger error for model {model_id}: {e}")
 
-    # Run S3 upload, thumbnail generation, and avatar processing in parallel
     task_names = ["upload_to_s3", "generate_thumbnail", "trigger_avatar_processing"]
     results = await asyncio.gather(
         upload_to_s3(),
@@ -391,7 +404,6 @@ async def process_upload_background_tasks(
         return_exceptions=True,
     )
 
-    # Log any exceptions from background tasks
     for name, result in zip(task_names, results):
         if isinstance(result, Exception):
             logger.error(f"Background task '{name}' failed for model {model_id}: {result}")
