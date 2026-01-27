@@ -67,5 +67,5 @@ class VideoModelListResponse(BaseModel):
 class DirectUploadResponse(BaseModel):
     """Response when uploading video directly to server"""
     model: VideoModelBrief
-    job_id: UUID
+    job_id: UUID | None = None  # Job created in background after video processing
     message: str

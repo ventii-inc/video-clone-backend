@@ -252,16 +252,9 @@ async def direct_upload_video(
     model.source_video_key = s3_key
     await db.commit()
 
-    # Create avatar generation job
-    job = await avatar_job_service.create_job(
-        video_model_id=model.id,
-        user_id=user.id,
-        db=db,
-    )
-    logger.info(f"Created avatar job {job.id} for video model {model.id}")
-
-    # Background tasks: S3 upload, thumbnail, and trigger avatar processing
-    # These run async - if they fail, recovery script will retry stuck uploads
+    # Background tasks: process video, create avatar job, S3 upload, thumbnail
+    # Avatar job is created AFTER video processing to avoid race condition
+    # where scheduler picks up job before video is processed
     background_tasks.add_task(
         process_upload_background_tasks,
         model_id=model.id,
@@ -272,7 +265,7 @@ async def direct_upload_video(
 
     return DirectUploadResponse(
         model=VideoModelBrief.model_validate(model),
-        job_id=job.id,
+        job_id=None,  # Job created in background after video processing
         message="Video uploaded, processing started",
     )
 
@@ -284,11 +277,13 @@ async def process_upload_background_tasks(
     s3_key: str,
 ):
     """
-    Background task to process video, upload to S3, generate thumbnail, and trigger avatar processing.
+    Background task to process video, create avatar job, upload to S3, generate thumbnail,
+    and trigger avatar processing.
 
     Flow:
     1. Process video (trim 60s, 25fps, remove audio)
-    2. In parallel: upload to S3, generate thumbnail, trigger avatar processing
+    2. Create avatar job (AFTER video is processed to avoid race condition)
+    3. In parallel: upload to S3, generate thumbnail, trigger avatar processing
     """
     from app.db import get_db_session
 
@@ -330,7 +325,30 @@ async def process_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 2: Run S3 upload, thumbnail generation, and avatar processing in parallel
+    # Step 2: Create avatar job NOW (after video is processed)
+    # This prevents race condition where scheduler picks up job before video processing completes
+    try:
+        async with get_db_session() as db:
+            job = await avatar_job_service.create_job(
+                video_model_id=model_id,
+                user_id=user_id,
+                db=db,
+            )
+            logger.info(f"Created avatar job {job.id} for video model {model_id}")
+    except Exception as e:
+        logger.error(f"Failed to create avatar job for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Failed to create avatar job: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 3: Run S3 upload, thumbnail generation, and avatar processing in parallel
     async def upload_to_s3():
         """Upload the processed video file to S3."""
         try:
