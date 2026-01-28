@@ -282,6 +282,9 @@ async def stripe_webhook(
         elif event.type == "invoice.payment_failed":
             await stripe_service.handle_invoice_payment_failed(event.data.object, db)
 
+        elif event.type == "customer.updated":
+            await stripe_service.handle_customer_updated(event.data.object, db)
+
         else:
             logger.debug(f"Unhandled webhook event type: {event.type}")
 

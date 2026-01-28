@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, SmallInteger, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -41,6 +41,12 @@ class Subscription(Base):
     canceled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Cached payment method info (updated via webhooks)
+    card_brand = Column(String(20), nullable=True)  # "visa", "mastercard", etc.
+    card_last4 = Column(String(4), nullable=True)  # "4242"
+    card_exp_month = Column(SmallInteger, nullable=True)  # 1-12
+    card_exp_year = Column(SmallInteger, nullable=True)  # 2025
 
     # Relationships
     user = relationship("User", back_populates="subscription")

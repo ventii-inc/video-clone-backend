@@ -1,5 +1,6 @@
 """Stripe service for handling payments and subscriptions"""
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -197,6 +198,55 @@ class StripeService:
             return session.get(key, default)
         return getattr(session, key, default)
 
+    async def _update_payment_method_cache(
+        self,
+        subscription: Subscription,
+        customer_id: str,
+    ) -> None:
+        """Fetch payment method from Stripe and cache in DB.
+
+        Note: Does not commit - caller is responsible for committing.
+        """
+        self._ensure_initialized()
+
+        try:
+            # Run Stripe call in thread pool to avoid blocking
+            customer = await asyncio.to_thread(
+                stripe.Customer.retrieve, customer_id
+            )
+
+            default_pm_id = customer.get("invoice_settings", {}).get("default_payment_method")
+
+            if not default_pm_id:
+                # List payment methods as fallback
+                pms = await asyncio.to_thread(
+                    stripe.PaymentMethod.list,
+                    customer=customer_id,
+                    type="card",
+                    limit=1,
+                )
+                pm_data = pms.get("data", [])
+                if pm_data:
+                    pm = pm_data[0]
+                    card = pm.get("card", {})
+                    subscription.card_brand = card.get("brand")
+                    subscription.card_last4 = card.get("last4")
+                    subscription.card_exp_month = card.get("exp_month")
+                    subscription.card_exp_year = card.get("exp_year")
+                    logger.info(f"Cached payment method (fallback) for user {subscription.user_id}")
+                return
+
+            pm = await asyncio.to_thread(stripe.PaymentMethod.retrieve, default_pm_id)
+            card = pm.get("card", {})
+            subscription.card_brand = card.get("brand")
+            subscription.card_last4 = card.get("last4")
+            subscription.card_exp_month = card.get("exp_month")
+            subscription.card_exp_year = card.get("exp_year")
+            logger.info(f"Cached payment method for user {subscription.user_id}")
+
+        except stripe.StripeError as e:
+            logger.error(f"Error updating payment method cache: {e}")
+
     async def handle_checkout_completed(
         self,
         session,  # Can be dict or StripeObject
@@ -275,6 +325,12 @@ class StripeService:
         if period_end:
             subscription.current_period_end = datetime.fromtimestamp(period_end)
         subscription.canceled_at = None
+
+        # Cache payment method info
+        await self._update_payment_method_cache(
+            subscription,
+            subscription.stripe_customer_id,
+        )
 
         await db.commit()
         logger.info(f"Activated subscription for user {user_id}")
@@ -441,70 +497,45 @@ class StripeService:
             await db.commit()
             logger.warning(f"Payment failed for user {sub_record.user_id}")
 
+    async def handle_customer_updated(
+        self,
+        customer,  # Can be dict or StripeObject
+        db: AsyncSession,
+    ) -> None:
+        """Handle customer.updated event - refresh payment method cache"""
+        customer_id = customer.get("id") if isinstance(customer, dict) else customer.id
+
+        result = await db.execute(
+            select(Subscription).where(Subscription.stripe_customer_id == customer_id)
+        )
+        subscription = result.scalar_one_or_none()
+
+        if subscription:
+            await self._update_payment_method_cache(subscription, customer_id)
+            await db.commit()
+            logger.info(f"Refreshed payment method cache for customer {customer_id}")
+
     async def get_default_payment_method(
         self,
         user: User,
         db: AsyncSession,
     ) -> Optional[dict]:
-        """Get user's default payment method from Stripe"""
-        self._ensure_initialized()
-
+        """Get user's default payment method from cached DB data"""
         result = await db.execute(
             select(Subscription).where(Subscription.user_id == user.id)
         )
         subscription = result.scalar_one_or_none()
 
-        if not subscription or not subscription.stripe_customer_id:
+        if not subscription or not subscription.card_last4:
             return None
 
-        try:
-            customer = stripe.Customer.retrieve(subscription.stripe_customer_id)
-
-            # Get default payment method (use dict access for StripeObject)
-            invoice_settings = customer.get("invoice_settings", {})
-            default_pm_id = invoice_settings.get("default_payment_method") if invoice_settings else None
-            if not default_pm_id:
-                # Try to get from default source (legacy)
-                default_pm_id = customer.get("default_source")
-
-            if not default_pm_id:
-                # Try to list payment methods attached to customer
-                payment_methods = stripe.PaymentMethod.list(
-                    customer=subscription.stripe_customer_id,
-                    type="card",
-                    limit=1,
-                )
-                pm_data = payment_methods.get("data", [])
-                if pm_data:
-                    payment_method = pm_data[0]
-                    card = payment_method.get("card", {})
-                    return {
-                        "type": "card",
-                        "brand": card.get("brand"),
-                        "last4": card.get("last4"),
-                        "exp_month": card.get("exp_month"),
-                        "exp_year": card.get("exp_year"),
-                    }
-                return None
-
-            payment_method = stripe.PaymentMethod.retrieve(default_pm_id)
-
-            pm_type = payment_method.get("type")
-            if pm_type == "card":
-                card = payment_method.get("card", {})
-                return {
-                    "type": "card",
-                    "brand": card.get("brand"),
-                    "last4": card.get("last4"),
-                    "exp_month": card.get("exp_month"),
-                    "exp_year": card.get("exp_year"),
-                }
-
-            return {"type": pm_type}
-
-        except stripe.StripeError as e:
-            logger.error(f"Error fetching payment method: {e}")
-            return None
+        return {
+            "type": "card",
+            "brand": subscription.card_brand,
+            "last4": subscription.card_last4,
+            "exp_month": subscription.card_exp_month,
+            "exp_year": subscription.card_exp_year,
+        }
 
     async def get_invoices(
         self,
