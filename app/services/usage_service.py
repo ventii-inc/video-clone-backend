@@ -28,8 +28,15 @@ class UsageService:
         self,
         user_id: int,
         db: AsyncSession,
+        subscription: Subscription | None = None,
     ) -> UsageRecord:
-        """Get or create usage record for current billing period."""
+        """Get or create usage record for current billing period.
+
+        Args:
+            user_id: The user's ID
+            db: Database session
+            subscription: Optional pre-fetched subscription to avoid redundant query
+        """
         now = datetime.utcnow()
         year = now.year
         month = now.month
@@ -47,11 +54,12 @@ class UsageService:
         if record:
             return record
 
-        # Get user's subscription to determine base minutes
-        sub_result = await db.execute(
-            select(Subscription).where(Subscription.user_id == user_id)
-        )
-        subscription = sub_result.scalar_one_or_none()
+        # Get user's subscription to determine base minutes (only if not provided)
+        if subscription is None:
+            sub_result = await db.execute(
+                select(Subscription).where(Subscription.user_id == user_id)
+            )
+            subscription = sub_result.scalar_one_or_none()
 
         base_minutes = 0
         if subscription:
@@ -143,9 +151,16 @@ class UsageService:
         self,
         user_id: int,
         db: AsyncSession,
+        subscription: Subscription | None = None,
     ) -> dict:
-        """Get usage summary for current period."""
-        record = await self.get_or_create_current_usage(user_id, db)
+        """Get usage summary for current period.
+
+        Args:
+            user_id: The user's ID
+            db: Database session
+            subscription: Optional pre-fetched subscription to avoid redundant query
+        """
+        record = await self.get_or_create_current_usage(user_id, db, subscription)
 
         return {
             "period_year": record.period_year,

@@ -1,5 +1,6 @@
 """Dashboard and usage router"""
 
+import asyncio
 from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,35 +24,42 @@ async def get_dashboard(
 ):
     """
     Get dashboard summary including usage, models count, and recent videos.
+
+    Performance optimized: All independent queries run in parallel using asyncio.gather().
+    Subscription is fetched first and passed to usage_service to avoid redundant query.
     """
-    # Get usage summary
-    usage = await usage_service.get_usage_summary(user.id, db)
-
-    # Get models count
-    video_models_result = await db.execute(
-        select(func.count()).select_from(VideoModel).where(VideoModel.user_id == user.id)
+    # First batch: fetch subscription and other independent queries in parallel
+    (
+        sub_result,
+        video_models_result,
+        voice_models_result,
+        recent_result,
+    ) = await asyncio.gather(
+        db.execute(
+            select(Subscription).where(Subscription.user_id == user.id)
+        ),
+        db.execute(
+            select(func.count()).select_from(VideoModel).where(VideoModel.user_id == user.id)
+        ),
+        db.execute(
+            select(func.count()).select_from(VoiceModel).where(VoiceModel.user_id == user.id)
+        ),
+        db.execute(
+            select(GeneratedVideo)
+            .where(GeneratedVideo.user_id == user.id)
+            .order_by(GeneratedVideo.created_at.desc())
+            .limit(5)
+        ),
     )
+
+    # Extract scalar values from results
+    subscription = sub_result.scalar_one_or_none()
     video_models_count = video_models_result.scalar()
-
-    voice_models_result = await db.execute(
-        select(func.count()).select_from(VoiceModel).where(VoiceModel.user_id == user.id)
-    )
     voice_models_count = voice_models_result.scalar()
-
-    # Get recent videos (last 5)
-    recent_result = await db.execute(
-        select(GeneratedVideo)
-        .where(GeneratedVideo.user_id == user.id)
-        .order_by(GeneratedVideo.created_at.desc())
-        .limit(5)
-    )
     recent_videos = recent_result.scalars().all()
 
-    # Get subscription
-    sub_result = await db.execute(
-        select(Subscription).where(Subscription.user_id == user.id)
-    )
-    subscription = sub_result.scalar_one_or_none()
+    # Get usage summary, passing subscription to avoid redundant query
+    usage = await usage_service.get_usage_summary(user.id, db, subscription)
 
     # Calculate period dates
     now = datetime.utcnow()
