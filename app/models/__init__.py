@@ -7,8 +7,10 @@ from app.models.video_model import VideoModel, ProcessingStage
 from app.models.voice_model import VoiceModel
 from app.models.generated_video import GeneratedVideo, VideoGenerationStage
 from app.models.usage_record import UsageRecord
+from app.models.training_usage_record import TrainingUsageRecord
 from app.models.payment_history import PaymentHistory
 from app.models.avatar_job import AvatarJob, JobStatus
+from app.models.deleted_account_record import DeletedAccountRecord
 
 __all__ = [
     "Base",
@@ -22,7 +24,9 @@ __all__ = [
     "GeneratedVideo",
     "VideoGenerationStage",
     "UsageRecord",
+    "TrainingUsageRecord",
     "PaymentHistory",
     "AvatarJob",
     "JobStatus",
+    "DeletedAccountRecord",
 ]

@@ -10,15 +10,9 @@ from sqlalchemy import select
 from app.models.user import User
 from app.models.subscription import Subscription, PlanType
 from app.models.usage_record import UsageRecord
+from app.utils.constants import PLAN_CONFIG
 
 logger = logging.getLogger(__name__)
-
-
-# Plan configurations
-PLAN_MINUTES = {
-    PlanType.FREE.value: 0,  # No free minutes
-    PlanType.STANDARD.value: 100,  # 100 minutes per month
-}
 
 
 class UsageService:
@@ -63,7 +57,8 @@ class UsageService:
 
         base_minutes = 0
         if subscription:
-            base_minutes = PLAN_MINUTES.get(subscription.plan_type, 0)
+            plan_config = PLAN_CONFIG.get(subscription.plan_type, {})
+            base_minutes = plan_config.get("minutes", 0)
 
         # Create new record
         record = UsageRecord(
@@ -211,6 +206,72 @@ class UsageService:
         """
         # Minimum 1 minute
         return max(1, (text_length + 149) // 150)
+
+    async def check_and_auto_charge(
+        self,
+        user_id: int,
+        required_minutes: int,
+        db: AsyncSession,
+    ) -> dict:
+        """Check if user has sufficient credits, auto-charge if needed (Standard plan only).
+
+        Returns dict with:
+        - has_credits: bool - whether user now has sufficient credits
+        - auto_charged: bool - whether auto-charge was performed
+        - error: str | None - error message if applicable
+        """
+        from app.services.stripe import stripe_service
+
+        record = await self.get_or_create_current_usage(user_id, db)
+
+        if record.remaining_minutes >= required_minutes:
+            return {"has_credits": True, "auto_charged": False, "error": None}
+
+        # Get subscription to check if auto-charge is available
+        result = await db.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        subscription = result.scalar_one_or_none()
+
+        if not subscription:
+            return {
+                "has_credits": False,
+                "auto_charged": False,
+                "error": "Insufficient credits. Please purchase additional minutes.",
+            }
+
+        if subscription.plan_type != PlanType.STANDARD.value:
+            return {
+                "has_credits": False,
+                "auto_charged": False,
+                "error": "Insufficient credits. Please upgrade to Standard plan for auto-charge.",
+            }
+
+        if not subscription.auto_charge_enabled:
+            return {
+                "has_credits": False,
+                "auto_charged": False,
+                "error": "Insufficient credits. Auto-charge is disabled. Please enable it or purchase minutes manually.",
+            }
+
+        # Attempt auto-charge
+        charge_result = await stripe_service.process_auto_charge(user_id, db)
+
+        if charge_result["success"]:
+            # Refresh usage record
+            record = await self.get_or_create_current_usage(user_id, db)
+            return {
+                "has_credits": record.remaining_minutes >= required_minutes,
+                "auto_charged": True,
+                "minutes_added": charge_result.get("minutes_added", 0),
+                "error": None,
+            }
+        else:
+            return {
+                "has_credits": False,
+                "auto_charged": False,
+                "error": f"Auto-charge failed: {charge_result.get('error', 'Unknown error')}",
+            }
 
 
 # Global instance

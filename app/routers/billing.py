@@ -36,6 +36,11 @@ class PurchaseMinutesRequest(BaseModel):
     cancel_url: str
 
 
+class ShotPlanRequest(BaseModel):
+    success_url: str
+    cancel_url: str
+
+
 @router.get("/subscription")
 async def get_subscription(
     user: User = Depends(get_current_user),
@@ -201,6 +206,48 @@ async def purchase_additional_minutes(
         )
 
 
+@router.post("/checkout/shot")
+async def create_shot_plan_checkout(
+    data: ShotPlanRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create Stripe Checkout session for Shot plan one-time purchase.
+
+    Shot plan: ¥980 for 10 minutes + 1 video training + 1 voice training.
+    Credits never expire.
+    """
+    try:
+        checkout_url = await stripe_service.create_shot_plan_checkout_session(
+            user=user,
+            success_url=data.success_url,
+            cancel_url=data.cancel_url,
+            db=db,
+        )
+
+        return {
+            "checkout_url": checkout_url,
+            "preview": {
+                "minutes_to_add": stripe_settings.shot_plan_minutes,
+                "video_trainings": stripe_settings.shot_plan_video_trainings,
+                "voice_trainings": stripe_settings.shot_plan_voice_trainings,
+                "amount_jpy": stripe_settings.shot_plan_price_jpy,
+            },
+        }
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+    except stripe.StripeError as e:
+        logger.error(f"Stripe error creating Shot plan checkout: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment service error. Please try again.",
+        )
+
+
 @router.get("/invoices")
 async def get_invoices(
     page: int = 1,
@@ -301,20 +348,44 @@ async def stripe_webhook(
 @router.get("/prices")
 async def get_prices():
     """
-    Get current pricing information.
+    Get current pricing information for all plans.
 
     Public endpoint - no authentication required.
     """
     return {
-        "subscription": {
+        "free": {
+            "name": "Free Plan",
+            "price_jpy": 0,
+            "minutes": 3,
+            "video_trainings": 1,
+            "voice_trainings": 1,
+            "is_lifetime": True,
+            "description": "Lifetime allowance - never resets",
+        },
+        "shot": {
+            "name": "Shot Plan",
+            "price_jpy": stripe_settings.shot_plan_price_jpy,
+            "minutes": stripe_settings.shot_plan_minutes,
+            "video_trainings": stripe_settings.shot_plan_video_trainings,
+            "voice_trainings": stripe_settings.shot_plan_voice_trainings,
+            "billing_period": "one_time",
+            "never_expires": True,
+            "description": "One-time purchase - credits never expire",
+        },
+        "standard": {
             "name": "Standard Plan",
             "price_jpy": stripe_settings.subscription_monthly_price_jpy,
             "minutes_per_month": stripe_settings.subscription_monthly_minutes,
+            "video_trainings_per_month": 5,
+            "voice_trainings_per_month": 5,
             "billing_period": "monthly",
+            "auto_charge_enabled": True,
+            "description": "Monthly subscription with auto-charge",
         },
         "minutes_pack": {
             "name": "Additional Minutes",
             "price_jpy": stripe_settings.minutes_pack_price_jpy,
             "minutes": stripe_settings.minutes_pack_quantity,
+            "bonus_trainings": stripe_settings.auto_charge_bonus_trainings,
         },
     }

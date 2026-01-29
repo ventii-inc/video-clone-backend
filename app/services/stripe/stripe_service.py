@@ -156,6 +156,134 @@ class StripeService:
         )
         return session.url
 
+    async def create_shot_plan_checkout_session(
+        self,
+        user: User,
+        success_url: str,
+        cancel_url: str,
+        db: AsyncSession,
+    ) -> str:
+        """Create Stripe Checkout session for Shot plan one-time purchase"""
+        self._ensure_initialized()
+
+        if not stripe_settings.stripe_price_shot:
+            raise ValueError("STRIPE_PRICE_SHOT not configured")
+
+        customer_id = await self.get_or_create_customer(user, db)
+
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            mode="payment",
+            line_items=[
+                {
+                    "price": stripe_settings.stripe_price_shot,
+                    "quantity": 1,
+                }
+            ],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "user_id": str(user.id),
+                "type": "shot_plan",
+            },
+        )
+
+        logger.info(f"Created Shot plan checkout session {session.id} for user {user.id}")
+        return session.url
+
+    async def process_auto_charge(
+        self,
+        user_id: int,
+        db: AsyncSession,
+    ) -> dict:
+        """Process automatic charge for Standard plan user when minutes exhausted.
+
+        Returns dict with success status and details.
+        """
+        self._ensure_initialized()
+
+        result = await db.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        subscription = result.scalar_one_or_none()
+
+        if not subscription:
+            return {"success": False, "error": "No subscription found"}
+
+        if subscription.plan_type != PlanType.STANDARD.value:
+            return {"success": False, "error": "Auto-charge only available for Standard plan"}
+
+        if not subscription.auto_charge_enabled:
+            return {"success": False, "error": "Auto-charge is disabled"}
+
+        if not subscription.stripe_customer_id:
+            return {"success": False, "error": "No payment method on file"}
+
+        try:
+            # Create payment intent and charge immediately
+            payment_intent = stripe.PaymentIntent.create(
+                amount=stripe_settings.auto_charge_price_jpy,
+                currency="jpy",
+                customer=subscription.stripe_customer_id,
+                off_session=True,
+                confirm=True,
+                metadata={
+                    "user_id": str(user_id),
+                    "type": "auto_charge",
+                },
+            )
+
+            if payment_intent.status == "succeeded":
+                # Add minutes to user's account
+                await usage_service.add_purchased_minutes(
+                    user_id, stripe_settings.auto_charge_minutes, db
+                )
+
+                # Add bonus trainings
+                from app.services.training_usage_service import training_usage_service
+                await training_usage_service.add_bonus_trainings(
+                    user_id,
+                    video_trainings=stripe_settings.auto_charge_bonus_trainings,
+                    voice_trainings=stripe_settings.auto_charge_bonus_trainings,
+                    db=db,
+                )
+
+                # Record payment history
+                payment = PaymentHistory(
+                    user_id=user_id,
+                    stripe_payment_intent_id=payment_intent.id,
+                    payment_type=PaymentType.AUTO_CHARGE.value,
+                    amount_cents=stripe_settings.auto_charge_price_jpy,
+                    currency="jpy",
+                    minutes_purchased=stripe_settings.auto_charge_minutes,
+                    status=PaymentStatus.SUCCEEDED.value,
+                )
+                db.add(payment)
+                await db.commit()
+
+                logger.info(
+                    f"Auto-charge successful for user {user_id}: "
+                    f"{stripe_settings.auto_charge_minutes} minutes added, "
+                    f"+{stripe_settings.auto_charge_bonus_trainings} bonus trainings"
+                )
+
+                return {
+                    "success": True,
+                    "minutes_added": stripe_settings.auto_charge_minutes,
+                    "amount_charged": stripe_settings.auto_charge_price_jpy,
+                    "bonus_trainings": stripe_settings.auto_charge_bonus_trainings,
+                }
+            else:
+                logger.warning(f"Auto-charge payment intent status: {payment_intent.status}")
+                return {"success": False, "error": f"Payment status: {payment_intent.status}"}
+
+        except stripe.CardError as e:
+            logger.warning(f"Auto-charge card error for user {user_id}: {e}")
+            return {"success": False, "error": f"Card declined: {e.user_message}"}
+        except stripe.StripeError as e:
+            logger.error(f"Auto-charge Stripe error for user {user_id}: {e}")
+            return {"success": False, "error": str(e)}
+
     async def create_portal_session(
         self,
         user: User,
@@ -276,6 +404,8 @@ class StripeService:
             await self._handle_subscription_checkout(session, user_id, db)
         elif checkout_type == "minutes_purchase":
             await self._handle_minutes_checkout(session, user_id, db)
+        elif checkout_type == "shot_plan":
+            await self._handle_shot_plan_checkout(session, user_id, db)
 
     async def _handle_subscription_checkout(
         self,
@@ -320,6 +450,11 @@ class StripeService:
         subscription.plan_type = PlanType.STANDARD.value
         subscription.status = SubscriptionStatus.ACTIVE.value
         subscription.monthly_minutes_limit = stripe_settings.subscription_monthly_minutes
+        subscription.monthly_video_training_limit = 5  # Standard plan: 5 trainings
+        subscription.monthly_voice_training_limit = 5
+        subscription.is_lifetime = False
+        subscription.is_one_time_purchase = False
+        subscription.auto_charge_enabled = True
         if period_start:
             subscription.current_period_start = datetime.fromtimestamp(period_start)
         if period_end:
@@ -371,6 +506,70 @@ class StripeService:
         await db.commit()
 
         logger.info(f"Added {minutes_to_add} minutes for user {user_id}")
+
+    async def _handle_shot_plan_checkout(
+        self,
+        session,  # Can be dict or StripeObject
+        user_id: int,
+        db: AsyncSession,
+    ) -> None:
+        """Handle Shot plan one-time purchase checkout completion"""
+        payment_intent_id = self._get_session_attr(session, "payment_intent")
+
+        # Get or create subscription record
+        result = await db.execute(
+            select(Subscription).where(Subscription.user_id == user_id)
+        )
+        subscription = result.scalar_one_or_none()
+
+        if not subscription:
+            # Create new subscription for Shot plan
+            subscription = Subscription(
+                user_id=user_id,
+                plan_type=PlanType.SHOT.value,
+                status=SubscriptionStatus.ACTIVE.value,
+                monthly_minutes_limit=stripe_settings.shot_plan_minutes,
+                monthly_video_training_limit=stripe_settings.shot_plan_video_trainings,
+                monthly_voice_training_limit=stripe_settings.shot_plan_voice_trainings,
+                is_one_time_purchase=True,
+                is_lifetime=False,
+                auto_charge_enabled=False,
+            )
+            db.add(subscription)
+        else:
+            # Upgrade to Shot plan (or add Shot plan credits)
+            subscription.plan_type = PlanType.SHOT.value
+            subscription.status = SubscriptionStatus.ACTIVE.value
+            subscription.monthly_minutes_limit = stripe_settings.shot_plan_minutes
+            subscription.monthly_video_training_limit = stripe_settings.shot_plan_video_trainings
+            subscription.monthly_voice_training_limit = stripe_settings.shot_plan_voice_trainings
+            subscription.is_one_time_purchase = True
+            subscription.auto_charge_enabled = False
+
+        # Add minutes to user's account (these never expire for Shot plan)
+        await usage_service.add_purchased_minutes(
+            user_id, stripe_settings.shot_plan_minutes, db
+        )
+
+        # Record payment history
+        payment = PaymentHistory(
+            user_id=user_id,
+            stripe_payment_intent_id=payment_intent_id,
+            payment_type=PaymentType.SHOT_PLAN.value,
+            amount_cents=stripe_settings.shot_plan_price_jpy,
+            currency="jpy",
+            minutes_purchased=stripe_settings.shot_plan_minutes,
+            status=PaymentStatus.SUCCEEDED.value,
+        )
+        db.add(payment)
+        await db.commit()
+
+        logger.info(
+            f"Shot plan activated for user {user_id}: "
+            f"{stripe_settings.shot_plan_minutes} minutes, "
+            f"{stripe_settings.shot_plan_video_trainings} video trainings, "
+            f"{stripe_settings.shot_plan_voice_trainings} voice trainings"
+        )
 
     async def handle_subscription_updated(
         self,

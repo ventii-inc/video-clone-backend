@@ -10,6 +10,7 @@ from app.db import get_db
 from app.models import User, VideoModel, VoiceModel, GeneratedVideo, Subscription
 from app.services.firebase import get_current_user
 from app.services.usage_service import usage_service
+from app.services.training_usage_service import training_usage_service
 from app.schemas.generated_video import GeneratedVideoListItem
 from app.schemas.video_model import VideoModelBrief
 from app.schemas.voice_model import VoiceModelBrief
@@ -61,6 +62,9 @@ async def get_dashboard(
     # Get usage summary, passing subscription to avoid redundant query
     usage = await usage_service.get_usage_summary(user.id, db, subscription)
 
+    # Get training usage summary
+    training_usage = await training_usage_service.get_training_summary(user.id, db, subscription)
+
     # Calculate period dates
     now = datetime.utcnow()
     period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -82,6 +86,7 @@ async def get_dashboard(
             "video_models_count": video_models_count,
             "voice_models_count": voice_models_count,
         },
+        "training_usage": training_usage,
         "recent_videos": [
             {
                 "id": str(v.id),

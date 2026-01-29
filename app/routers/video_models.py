@@ -18,8 +18,8 @@ from app.services.s3 import s3_service
 from app.services.avatar_job import avatar_job_service
 from app.services.video import extract_thumbnail, video_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
+from app.services.training_usage_service import training_usage_service
 from app.utils import logger
-from app.utils.constants import MAX_VIDEO_MODELS_PER_USER
 from app.schemas.common import MessageResponse, PaginationMeta
 from app.schemas.video_model import (
     VideoModelResponse,
@@ -185,16 +185,15 @@ async def direct_upload_video(
        - Upload video to S3
        - Generate avatar (which uploads to S3 when complete)
     """
-    # Check model creation limit (bypass if user has flag set)
+    # Check training limit (bypass if user has flag set)
     if not user.bypass_model_limit:
-        count_result = await db.execute(
-            select(func.count()).where(VideoModel.user_id == user.id)
+        can_create, error_msg = await training_usage_service.can_create_video_model(
+            user.id, db
         )
-        current_count = count_result.scalar()
-        if current_count >= MAX_VIDEO_MODELS_PER_USER:
+        if not can_create:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Maximum number of video models ({MAX_VIDEO_MODELS_PER_USER}) reached",
+                detail=error_msg,
             )
 
     # Validate content type
@@ -228,6 +227,10 @@ async def direct_upload_video(
     db.add(model)
     await db.commit()
     await db.refresh(model)
+
+    # Consume a video training slot (only if not bypassing limit)
+    if not user.bypass_model_limit:
+        await training_usage_service.consume_video_training(user.id, db)
 
     # Save raw file locally (processing happens in background)
     settings = LiveTalkingSettings()

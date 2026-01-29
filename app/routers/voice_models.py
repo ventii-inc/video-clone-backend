@@ -16,6 +16,7 @@ from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.ai import ai_service
 from app.services.fish_audio import fish_audio_service
+from app.services.training_usage_service import training_usage_service
 from app.schemas.common import MessageResponse, PaginationMeta, UploadInfo
 from app.schemas.voice_model import (
     VoiceModelCreate,
@@ -28,7 +29,6 @@ from app.schemas.voice_model import (
     DirectVoiceUploadResponse,
 )
 from app.utils import logger
-from app.utils.constants import MAX_VOICE_MODELS_PER_USER
 
 router = APIRouter(prefix="/models/voice", tags=["Voice Models"])
 
@@ -129,16 +129,15 @@ async def create_voice_model(
     """
     Create a new voice model and get presigned upload URL.
     """
-    # Check model creation limit (bypass if user has flag set)
+    # Check training limit (bypass if user has flag set)
     if not user.bypass_model_limit:
-        count_result = await db.execute(
-            select(func.count()).where(VoiceModel.user_id == user.id)
+        can_create, error_msg = await training_usage_service.can_create_voice_model(
+            user.id, db
         )
-        current_count = count_result.scalar()
-        if current_count >= MAX_VOICE_MODELS_PER_USER:
+        if not can_create:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+                detail=error_msg,
             )
 
     # Validate content type
@@ -166,6 +165,10 @@ async def create_voice_model(
     db.add(model)
     await db.commit()
     await db.refresh(model)
+
+    # Consume a voice training slot (only if not bypassing limit)
+    if not user.bypass_model_limit:
+        await training_usage_service.consume_voice_training(user.id, db)
 
     # Generate S3 key and presigned URL
     s3_key = s3_service.generate_s3_key(
@@ -215,16 +218,15 @@ async def direct_upload_voice(
        - Upload audio to S3
        - Process voice (trim + Fish Audio cloning)
     """
-    # Check model creation limit (bypass if user has flag set)
+    # Check training limit (bypass if user has flag set)
     if not user.bypass_model_limit:
-        count_result = await db.execute(
-            select(func.count()).where(VoiceModel.user_id == user.id)
+        can_create, error_msg = await training_usage_service.can_create_voice_model(
+            user.id, db
         )
-        current_count = count_result.scalar()
-        if current_count >= MAX_VOICE_MODELS_PER_USER:
+        if not can_create:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Maximum number of voice models ({MAX_VOICE_MODELS_PER_USER}) reached",
+                detail=error_msg,
             )
 
     # Validate content type
@@ -264,6 +266,10 @@ async def direct_upload_voice(
     db.add(model)
     await db.commit()
     await db.refresh(model)
+
+    # Consume a voice training slot (only if not bypassing limit)
+    if not user.bypass_model_limit:
+        await training_usage_service.consume_voice_training(user.id, db)
 
     # Save file to temp directory
     ext = os.path.splitext(file.filename or "audio.mp3")[1] or ".mp3"
