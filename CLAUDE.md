@@ -39,8 +39,16 @@ Required environment variables:
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` - PostgreSQL connection
 - `S3_AWS_REGION`, `S3_AWS_ACCESS_KEY_ID`, `S3_AWS_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` - AWS S3 configuration
 - `FIREBASE_CREDENTIALS_FILE` - Path to Firebase service account JSON file
-- `SENTRY_DSN` (optional) - Sentry error tracking (disabled in debug mode)
-- `CORS_ORIGINS` (optional) - Comma-separated list of additional CORS origins
+
+Optional environment variables:
+- `SENTRY_DSN` - Sentry error tracking (disabled in debug mode)
+- `CORS_ORIGINS` - Comma-separated list of additional CORS origins
+- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STANDARD`, `STRIPE_PRICE_MINUTES` - Stripe billing
+- `FISH_AUDIO_API_KEY` - Fish Audio voice cloning and TTS
+- `LIVETALKING_ROOT`, `LIVETALKING_VENV`, `LIVETALKING_MODE` - LiveTalking avatar generation (cli/api/auto)
+- `AVATAR_API_KEY` - API key for backend-to-backend avatar endpoints
+- `AVATAR_MAX_CONCURRENT` - Max concurrent avatar generation jobs (default: 3)
+- `AVATAR_JOB_CHECK_INTERVAL` - Interval in seconds for background job status checks (default: 10)
 
 ## Architecture
 
@@ -49,15 +57,36 @@ Required environment variables:
 **API Pattern:**
 - All API routes are prefixed with `/api/v1` (defined in `app/utils/constants.py`)
 - Routers use tags for OpenAPI grouping
-- Authentication via Firebase token in `Authorization: Bearer <token>` header
+- User authentication: Firebase token in `Authorization: Bearer <token>` header
+- Backend-to-backend auth: API key in `X-API-Key` header (see `app/services/api_key/`)
 
 **Key Modules:**
-- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings)
-- `app/models/` - SQLAlchemy models (User, UserProfile, VideoModel, VoiceModel, GeneratedVideo, Subscription, etc.)
+- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings, avatar, avatar_backend)
+- `app/models/` - SQLAlchemy models (User, UserProfile, VideoModel, VoiceModel, GeneratedVideo, Subscription, AvatarJob, etc.)
 - `app/schemas/` - Pydantic request/response schemas
-- `app/services/` - Business logic (firebase, s3, ai, usage_service)
+- `app/services/` - Business logic services (see Service Layer below)
 - `app/utils/` - Helpers (logger, constants, response_utils, sentry_utils)
 - `app/middleware/` - Performance monitoring middleware
+
+**Service Layer:**
+- `firebase/` - Firebase auth, token verification, user dependencies
+- `s3/` - S3 file uploads, downloads, presigned URLs
+- `stripe/` - Stripe payments, subscriptions, webhooks
+- `fish_audio/` - Voice cloning and TTS via Fish Audio API
+- `livetalking/` - Avatar generation via CLI subprocess or RunPod API
+- `avatar_job/` - Avatar generation job queue with concurrency control
+- `scheduler/` - Background task scheduler for periodic job status checks
+- `video/` - Video generation orchestration
+- `audio/` - Audio processing utilities
+- `progress/` - Progress tracking for long-running operations
+- `usage_service.py` - Credit/minutes tracking per billing period
+
+**Avatar Generation Pipeline:**
+1. User uploads video → `VideoModel` created with `status=PENDING`
+2. `AvatarJob` queued → job processor checks concurrent slots
+3. Execution mode chosen (CLI local or RunPod API based on GPU availability)
+4. Progress tracked via `ProcessingStage` enum (PENDING → PREPARING → TRAINING → FINALIZING → COMPLETED)
+5. Result uploaded to S3 as `.tar` archive → email notification sent
 
 **Database Session Patterns:**
 - `get_db()` - Async FastAPI dependency for route injection (use with `Depends(get_db)`)
@@ -86,7 +115,7 @@ return error_response("CUSTOM_ERROR", "Something went wrong", status_code=400)
 **Firebase Auth Usage:**
 ```python
 from fastapi import Depends
-from app.services.firebase import get_current_user, get_current_user_or_create
+from app.services.firebase import get_current_user, get_current_user_or_create, get_optional_user
 from app.models import User
 
 # Protected route - requires existing user
@@ -98,6 +127,22 @@ async def get_profile(user: User = Depends(get_current_user)):
 @router.post("/login")
 async def login(user: User = Depends(get_current_user_or_create)):
     return {"message": "Welcome", "user_id": user.id}
+
+# Optional auth - returns None if not authenticated
+@router.get("/public")
+async def public_route(user: User | None = Depends(get_optional_user)):
+    return {"authenticated": user is not None}
+```
+
+**API Key Auth (Backend-to-Backend):**
+```python
+from fastapi import Depends
+from app.services.api_key import get_api_key
+
+@router.post("/internal/callback")
+async def internal_callback(api_key: str = Depends(get_api_key)):
+    # Protected by X-API-Key header
+    pass
 ```
 
 **S3 Service Usage:**
@@ -106,6 +151,7 @@ from app.services.s3 import s3_service
 
 await s3_service.upload_file("/path/to/file.mp4", "videos/user123/video.mp4")
 await s3_service.upload_fileobj(file.file, "videos/user123/video.mp4", content_type="video/mp4")
+await s3_service.download_file("videos/user123/video.mp4", "/local/path.mp4")
 url = await s3_service.generate_presigned_url("videos/user123/video.mp4")
 upload_url = await s3_service.generate_presigned_upload_url("videos/user123/video.mp4", content_type="video/mp4")
 exists = await s3_service.file_exists("videos/user123/video.mp4")
@@ -113,8 +159,34 @@ await s3_service.delete_file("videos/user123/video.mp4")
 s3_key = s3_service.generate_s3_key("user123", "video.mp4", media_type="videos")
 ```
 
-**AI Service:**
-The `app/services/ai/ai_service.py` contains a mock implementation for video/voice model processing and video generation. Replace with actual AI API integrations in production.
+**Fish Audio Service (Voice Cloning & TTS):**
+```python
+from app.services.fish_audio import fish_audio_service
+
+# Clone voice from audio bytes
+result = await fish_audio_service.clone_voice(audio_data, "Voice Name", visibility="private")
+if result.success:
+    model_id = result.model_id
+
+# Generate speech from cloned voice
+tts_result = await fish_audio_service.text_to_speech("Hello world", reference_id=model_id)
+if tts_result.success:
+    audio_path = tts_result.audio_path
+```
+
+**Avatar Job Service:**
+```python
+from app.services.avatar_job import avatar_job_service
+
+# Create and queue a job
+job = await avatar_job_service.create_job(video_model_id, user_id, db)
+
+# Process pending jobs (respects AVATAR_MAX_CONCURRENT)
+jobs_started = await avatar_job_service.process_pending_jobs(db)
+
+# Retry a failed job
+job = await avatar_job_service.retry_job(job_id, db)
+```
 
 **Firebase Setup:**
 1. Download service account JSON from Firebase Console

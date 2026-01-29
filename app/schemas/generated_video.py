@@ -11,6 +11,7 @@ from app.schemas.voice_model import VoiceModelBrief
 
 
 GenerationStatus = Literal["queued", "processing", "completed", "failed"]
+VideoGenerationStage = Literal["queued", "preparing", "generating", "completed", "failed"]
 Resolution = Literal["720p", "1080p"]
 Language = Literal["ja", "en"]
 
@@ -65,6 +66,8 @@ class GeneratedVideoResponse(BaseModel):
     resolution: Resolution
     credits_used: int
     status: GenerationStatus
+    processing_stage: VideoGenerationStage = "queued"
+    progress_percent: int = 0
     error_message: str | None = None
     video_model: VideoModelBrief | None
     voice_model: VoiceModelBrief | None
@@ -81,11 +84,12 @@ class GeneratedVideoListItem(BaseModel):
     id: UUID
     title: str | None
     thumbnail_url: str | None
+    output_video_url: str | None
     duration_seconds: int | None
     resolution: Resolution
     status: GenerationStatus
-    video_model: VideoModelBrief | None
-    voice_model: VoiceModelBrief | None
+    video_model_id: UUID | None = None
+    voice_model_id: UUID | None = None
     created_at: datetime
 
     class Config:
@@ -107,8 +111,9 @@ class GenerationStatusDetail(BaseModel):
     """Detailed generation status"""
     id: UUID
     status: GenerationStatus
+    processing_stage: VideoGenerationStage = "queued"
     queue_position: int | None = None
-    progress_percent: int | None = None
+    progress_percent: int = 0
     estimated_remaining_seconds: int | None = None
     output_video_url: str | None = None
     thumbnail_url: str | None = None

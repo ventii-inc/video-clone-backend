@@ -39,7 +39,7 @@ class AvatarJob(Base):
 
     # Retry tracking
     attempts = Column(Integer, default=0, nullable=False)
-    max_attempts = Column(Integer, default=3, nullable=False)
+    max_attempts = Column(Integer, default=1, nullable=False)  # No retries by default
     error_message = Column(Text, nullable=True)
 
     # Timestamps
@@ -49,6 +49,10 @@ class AvatarJob(Base):
 
     # RunPod tracking
     runpod_job_id = Column(String(100), nullable=True, index=True)
+
+    # Detached process tracking (for CLI mode)
+    pid = Column(Integer, nullable=True)  # Process ID of detached subprocess
+    output_file = Column(String(500), nullable=True)  # Path to output JSON file
 
     # Result
     avatar_s3_key = Column(String(500), nullable=True)

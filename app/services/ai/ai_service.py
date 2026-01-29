@@ -1,7 +1,10 @@
-"""Mock AI service for video/voice model processing and video generation.
+"""AI service for video/voice model processing and video generation.
 
-This is a placeholder implementation that simulates AI processing.
-Replace with actual AI API integrations in production.
+Supports two modes:
+- CLI mode: Uses local LiveTalking subprocess for avatar/video generation
+- Mock mode: Simulates processing for development/testing
+
+Set LIVETALKING_MODE=cli in environment to use CLI mode.
 """
 
 import asyncio
@@ -16,26 +19,105 @@ from sqlalchemy import select
 
 from app.models.video_model import VideoModel, ModelStatus as VideoModelStatus
 from app.models.voice_model import VoiceModel, ModelStatus as VoiceModelStatus
-from app.models.generated_video import GeneratedVideo, GenerationStatus
+from app.models.generated_video import GeneratedVideo, GenerationStatus, VideoGenerationStage
+from app.services.progress import calculate_training_progress, calculate_expected_generation_time
+from app.db import get_db_session
+from app.models.user import User
 from app.services.s3 import s3_service
+from app.services.email import VideoGenerationCompletionData, get_email_service
+from app.services.usage_service import usage_service
 from app.services.video import video_service, get_video_duration
+from app.services.audio import audio_service, get_audio_duration
+from app.services.livetalking import livetalking_cli_service
+from app.services.livetalking.livetalking_config import LiveTalkingSettings
+from app.services.fish_audio import fish_audio_service
 
 logger = logging.getLogger(__name__)
 
 
 class AIService:
-    """Mock AI service for development and testing.
+    """AI service for video/voice model processing and video generation.
 
-    In production, this should integrate with:
+    Supports two modes based on LIVETALKING_MODE:
+    - "cli": Uses local LiveTalking subprocess (same server deployment)
+    - "api"/"mock": Uses mock implementation for development/testing
+
+    In full production with remote LiveTalking, integrate with:
     - Video clone model training API
     - Voice clone model training API
     - Lip-sync video generation API
     """
 
-    # Simulated processing times (in seconds)
+    # Simulated processing times (in seconds) for mock mode
     VIDEO_MODEL_PROCESSING_TIME = 5  # Real: 5-30 minutes
     VOICE_MODEL_PROCESSING_TIME = 3  # Real: 2-10 minutes
     VIDEO_GENERATION_TIME = 4  # Real: varies by text length
+
+    def _calculate_minutes_from_duration(self, duration_seconds: int | None) -> int:
+        """Calculate billable minutes from video duration in seconds.
+
+        Rounds up to nearest minute, minimum 1 minute.
+        """
+        if not duration_seconds or duration_seconds <= 0:
+            return 1  # Minimum 1 minute charge
+        # Round up to nearest minute
+        return max(1, (duration_seconds + 59) // 60)
+
+    async def _send_video_completion_email(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Send email notification when video generation completes."""
+        try:
+            # Fetch user for email notification
+            user_result = await db.execute(
+                select(User).where(User.id == video.user_id)
+            )
+            user = user_result.scalar_one_or_none()
+
+            if user and user.email:
+                email_service = get_email_service()
+                await email_service.send_video_generation_completion_email(
+                    to_email=user.email,
+                    data=VideoGenerationCompletionData(
+                        user_name=user.name or user.email.split("@")[0],
+                        video_title=video.title or "Untitled Video",
+                        duration_seconds=video.duration_seconds,
+                        dashboard_url="https://ventii.jp/dashboard/videos",
+                    ),
+                )
+                logger.info(f"Sent video completion email to {user.email} for video {video.id}")
+        except Exception as e:
+            logger.warning(f"Failed to send video completion email for video {video.id}: {e}")
+
+    async def _deduct_credits_for_video(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Deduct credits based on actual video duration after generation completes."""
+        minutes_used = self._calculate_minutes_from_duration(video.duration_seconds)
+
+        try:
+            await usage_service.deduct_credits(video.user_id, minutes_used, db)
+            video.credits_used = minutes_used
+            await db.commit()
+            logger.info(
+                f"Deducted {minutes_used} minutes for video {video.id} "
+                f"(duration: {video.duration_seconds}s)"
+            )
+        except ValueError as e:
+            # Insufficient credits - log but don't fail the video
+            # Video was already generated, so we still charge what we can
+            logger.warning(f"Credit deduction issue for video {video.id}: {e}")
+            video.credits_used = minutes_used
+            await db.commit()
+
+    def _get_mode(self) -> str:
+        """Get execution mode from settings."""
+        settings = LiveTalkingSettings()
+        return settings.LIVETALKING_MODE
 
     async def process_video_model(
         self,
@@ -164,13 +246,20 @@ class AIService:
         self,
         model_id: UUID,
         db: AsyncSession,
+        local_audio_path: str | None = None,
     ) -> None:
-        """Process a voice model (mock implementation).
+        """Process a voice model using Fish Audio voice cloning.
 
-        In production, this would:
-        1. Download source audio from S3
-        2. Send to AI API for voice cloning
-        3. Store trained model data
+        Steps:
+        1. Download source audio from S3 (or use local file if provided)
+        2. Trim to 60 seconds if longer
+        3. Send to Fish Audio API for voice cloning
+        4. Store the Fish Audio model ID for TTS generation
+
+        Args:
+            model_id: Voice model ID to process
+            db: Database session
+            local_audio_path: Optional path to local audio file (skips S3 download)
         """
         logger.info(f"Starting voice model processing: {model_id}")
 
@@ -189,27 +278,195 @@ class AIService:
         model.processing_started_at = datetime.utcnow()
         await db.commit()
 
-        # Simulate processing time
+        # Check if Fish Audio is configured
+        if not fish_audio_service.is_configured():
+            logger.warning("Fish Audio not configured, using mock mode")
+            await self._process_voice_model_mock(model, db)
+            return
+
+        try:
+            # Process training audio: download (or use local file), trim if needed, re-upload
+            # Returns the path to the processed audio file for local cloning
+            processed_audio_path = await self._process_training_audio(
+                model, db, local_audio_path=local_audio_path
+            )
+
+            # Clone voice using Fish Audio
+            # Prefer using local file directly (avoids S3 race condition)
+            if processed_audio_path and os.path.exists(processed_audio_path):
+                logger.info(f"Using local audio file for Fish Audio cloning: {processed_audio_path}")
+                with open(processed_audio_path, "rb") as f:
+                    audio_data = f.read()
+                clone_result = await fish_audio_service.clone_voice(
+                    audio_data=audio_data,
+                    title=model.name,
+                    description=f"Voice model for user {model.user_id}",
+                )
+            else:
+                # Fallback: download from S3 (for presigned upload flow where no local file exists)
+                if not model.source_audio_key:
+                    raise ValueError("No source audio key found")
+
+                logger.info(f"Falling back to S3 URL for Fish Audio cloning: {model.source_audio_key}")
+                audio_url = await s3_service.generate_presigned_url(
+                    model.source_audio_key, expiration=3600
+                )
+                clone_result = await fish_audio_service.clone_voice_from_url(
+                    audio_url=audio_url,
+                    title=model.name,
+                    description=f"Voice model for user {model.user_id}",
+                )
+
+            if not clone_result.success:
+                raise ValueError(clone_result.error or "Voice cloning failed")
+
+            # Store Fish Audio model ID
+            model.status = VoiceModelStatus.COMPLETED.value
+            model.processing_completed_at = datetime.utcnow()
+            model.reference_id = clone_result.model_id  # Store Fish Audio model ID
+
+            await db.commit()
+            logger.info(
+                f"Voice model processing completed: {model_id}, "
+                f"fish_audio_id={clone_result.model_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"Voice model processing failed: {e}")
+            model.status = VoiceModelStatus.FAILED.value
+            model.error_message = str(e)[:500]
+            model.processing_completed_at = datetime.utcnow()
+            await db.commit()
+        finally:
+            # Clean up temp directory if it was created
+            if hasattr(self, '_temp_audio_dir') and self._temp_audio_dir:
+                import shutil
+                try:
+                    shutil.rmtree(self._temp_audio_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                self._temp_audio_dir = None
+
+    async def _process_training_audio(
+        self,
+        model: VoiceModel,
+        db: AsyncSession,
+        local_audio_path: str | None = None,
+    ) -> str | None:
+        """
+        Download (or use local file), trim (if needed), and re-upload training audio.
+
+        Training audio is trimmed to a maximum of 60 seconds.
+
+        Args:
+            model: Voice model to process
+            db: Database session
+            local_audio_path: Optional path to local audio file (skips S3 download)
+
+        Returns:
+            Path to processed audio file (for use in Fish Audio cloning), or None if no audio
+        """
+        if not model.source_audio_key and not local_audio_path:
+            logger.warning(f"No source audio key or local path for model {model.id}")
+            return None
+
+        # Create temp directory for processing (using instance variable to persist during cloning)
+        self._temp_audio_dir = tempfile.mkdtemp()
+        temp_dir = self._temp_audio_dir
+
+        # Determine file extension from s3 key or local path
+        source_path = local_audio_path or model.source_audio_key
+        ext = os.path.splitext(source_path)[1] or ".wav"
+        output_path = os.path.join(temp_dir, f"output{ext}")
+
+        # Use local file if provided, otherwise download from S3
+        if local_audio_path and os.path.exists(local_audio_path):
+            input_path = local_audio_path
+            logger.info(f"Using local audio file: {local_audio_path}")
+        else:
+            input_path = os.path.join(temp_dir, f"input{ext}")
+            # Download audio from S3
+            logger.info(f"Downloading audio from S3: {model.source_audio_key}")
+            success = await s3_service.download_file(model.source_audio_key, input_path)
+
+            if not success:
+                raise ValueError(f"Failed to download audio from S3: {model.source_audio_key}")
+
+        # Process (trim if needed)
+        try:
+            final_path, duration, was_trimmed = await audio_service.process_training_audio(
+                input_path, output_path
+            )
+
+            # Update duration on model
+            model.duration_seconds = int(duration)
+
+            if was_trimmed:
+                logger.info(f"Audio was trimmed to {duration}s, re-uploading to S3")
+
+                # Get file size of trimmed audio
+                model.file_size_bytes = os.path.getsize(final_path)
+
+                # Re-upload trimmed audio to same S3 key
+                content_type = s3_service._get_content_type(final_path)
+                await s3_service.upload_file(
+                    final_path,
+                    model.source_audio_key,
+                    content_type=content_type,
+                )
+                logger.info(f"Trimmed audio uploaded to S3: {model.source_audio_key}")
+            else:
+                logger.info(f"Audio duration is {duration}s, no trimming needed")
+                # Update file size from original
+                model.file_size_bytes = os.path.getsize(input_path)
+
+            await db.commit()
+
+            # Return the path to the processed audio file for Fish Audio cloning
+            return final_path
+
+        except ValueError as e:
+            # If trimming fails but we can still get duration, continue
+            duration = await get_audio_duration(input_path)
+            if duration:
+                model.duration_seconds = int(duration)
+                model.file_size_bytes = os.path.getsize(input_path)
+                await db.commit()
+                logger.warning(f"Trim failed but continuing with original audio: {e}")
+                # Return the input path if trimming failed
+                return input_path
+            else:
+                raise
+
+    async def _process_voice_model_mock(
+        self,
+        model: VoiceModel,
+        db: AsyncSession,
+    ) -> None:
+        """Mock voice model processing for development."""
         await asyncio.sleep(self.VOICE_MODEL_PROCESSING_TIME)
 
-        # Mock success
         model.status = VoiceModelStatus.COMPLETED.value
         model.processing_completed_at = datetime.utcnow()
-        model.model_data_url = f"s3://mock-bucket/models/voice/{model_id}/model.bin"
+        model.reference_id = f"mock://fish-audio/{model.id}"
 
         await db.commit()
-        logger.info(f"Voice model processing completed: {model_id}")
+        logger.info(f"Mock voice model processing completed: {model.id}")
 
     async def generate_video(
         self,
         video_id: UUID,
         db: AsyncSession,
     ) -> None:
-        """Generate a video from text using clone models (mock implementation).
+        """Generate a video from text using clone models.
 
-        In production, this would:
+        Supports two modes:
+        - CLI mode: Uses LiveTalking CLI for actual generation
+        - Mock mode: Simulates processing for development
+
+        Steps:
         1. Load video and voice clone models
-        2. Generate speech audio from text
+        2. Generate speech audio from text (TTS)
         3. Generate lip-synced video
         4. Upload to S3
         """
@@ -227,9 +484,192 @@ class AIService:
 
         # Update status to processing
         video.status = GenerationStatus.PROCESSING.value
+        video.processing_stage = VideoGenerationStage.PREPARING.value
+        video.progress_percent = 5
         video.processing_started_at = datetime.utcnow()
         video.queue_position = None
         await db.commit()
+
+        mode = self._get_mode()
+
+        if mode == "cli":
+            await self._generate_video_cli(video, db)
+        else:
+            await self._generate_video_mock(video, db)
+
+    async def _run_video_progress_updater(
+        self,
+        video_id: UUID,
+        input_text: str,
+    ) -> None:
+        """
+        Periodically update video generation progress using asymptotic formula.
+
+        This runs concurrently with the actual generation, updating progress
+        from 20% toward 78% (never reaching 80% until actual completion).
+        Uses its own DB session since the main session is held during CLI.
+
+        Expected time is calculated based on word count:
+        - Base time for first 200 words: 240 seconds (4 minutes)
+        - Each additional 100 words: +30 seconds
+        - Progress 80-100% is reserved for actual completion only
+        """
+        expected_seconds = calculate_expected_generation_time(input_text)
+
+        start_time = datetime.utcnow()
+
+        while True:
+            try:
+                elapsed = (datetime.utcnow() - start_time).total_seconds()
+                # Calculate progress from 20-78% (asymptotic, slows down)
+                progress = calculate_training_progress(
+                    elapsed_seconds=elapsed,
+                    expected_seconds=expected_seconds,
+                    start_percent=20,
+                    max_percent=78,  # Cap at 78%, leaving room for 80-100% on completion
+                )
+
+                # Update in DB using fresh session
+                async with get_db_session() as update_db:
+                    result = await update_db.execute(
+                        select(GeneratedVideo).where(GeneratedVideo.id == video_id)
+                    )
+                    video = result.scalar_one_or_none()
+                    if video and video.status == GenerationStatus.PROCESSING.value:
+                        video.progress_percent = progress
+                        await update_db.commit()
+                        logger.debug(f"Video {video_id} progress: {progress}%")
+
+                await asyncio.sleep(2)  # Update every 2 seconds
+
+            except asyncio.CancelledError:
+                # Task was cancelled (generation completed)
+                logger.debug(f"Progress updater cancelled for video {video_id}")
+                raise
+            except Exception as e:
+                logger.warning(f"Error updating video progress: {e}")
+                await asyncio.sleep(2)  # Continue despite errors
+
+    async def _generate_video_cli(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Generate video using LiveTalking CLI."""
+        progress_task = None
+
+        try:
+            # Set preparing stage
+            video.processing_stage = VideoGenerationStage.PREPARING.value
+            video.progress_percent = 10
+            await db.commit()
+
+            # Get the video model to get avatar_id
+            video_model_result = await db.execute(
+                select(VideoModel).where(VideoModel.id == video.video_model_id)
+            )
+            video_model = video_model_result.scalar_one_or_none()
+
+            if not video_model:
+                raise ValueError("Video model not found")
+
+            avatar_id = str(video.video_model_id)
+
+            # Generate output path
+            output_filename = f"{video.id}.mp4"
+            output_path = os.path.join(tempfile.gettempdir(), output_filename)
+
+            # Get voice model for TTS reference (if applicable)
+            voice_model_result = await db.execute(
+                select(VoiceModel).where(VoiceModel.id == video.voice_model_id)
+            )
+            voice_model = voice_model_result.scalar_one_or_none()
+            ref_file = voice_model.reference_id if voice_model else None
+
+            # Update to generating stage and start progress updater
+            video.processing_stage = VideoGenerationStage.GENERATING.value
+            video.progress_percent = 20
+            await db.commit()
+
+            # Start concurrent progress updater with text-based expected time
+            progress_task = asyncio.create_task(
+                self._run_video_progress_updater(video.id, video.input_text)
+            )
+
+            # Run CLI video generation
+            logger.info(f"Running CLI video generation for {video.id}")
+            result = await livetalking_cli_service.generate_video(
+                avatar_id=avatar_id,
+                text=video.input_text,
+                output_path=output_path,
+                user_id=video.user_id,
+                ref_file=ref_file,
+                upload_to_s3=True,
+            )
+
+            # Cancel progress updater now that generation is complete
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
+            if not result.success:
+                # Store log file path even on failure for debugging
+                video.output_file = result.output_file
+                await db.commit()
+                raise ValueError(result.error or "Video generation failed")
+
+            # Update video record with results - COMPLETED
+            video.status = GenerationStatus.COMPLETED.value
+            video.processing_stage = VideoGenerationStage.COMPLETED.value
+            video.processing_completed_at = datetime.utcnow()
+            video.progress_percent = 100
+            video.duration_seconds = int(result.duration) if result.duration else None
+            video.output_video_key = result.s3_key
+            video.output_file = result.output_file
+
+            # Get file size
+            if os.path.exists(output_path):
+                video.file_size_bytes = os.path.getsize(output_path)
+                # Clean up local file
+                os.remove(output_path)
+
+            await db.commit()
+
+            # Deduct credits based on actual video duration
+            await self._deduct_credits_for_video(video, db)
+
+            # Send email notification
+            await self._send_video_completion_email(video, db)
+
+            logger.info(f"CLI video generation completed: {video.id}")
+
+        except Exception as e:
+            # Cancel progress updater on error
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+
+            logger.error(f"CLI video generation failed: {e}")
+            video.status = GenerationStatus.FAILED.value
+            video.processing_stage = VideoGenerationStage.FAILED.value
+            video.error_message = str(e)[:500]
+            video.processing_completed_at = datetime.utcnow()
+            await db.commit()
+
+    async def _generate_video_mock(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Generate video using mock implementation (for development)."""
+        # Set generating stage
+        video.processing_stage = VideoGenerationStage.GENERATING.value
 
         # Simulate progress updates
         for progress in [25, 50, 75, 100]:
@@ -244,16 +684,24 @@ class AIService:
 
         # Mock success
         video.status = GenerationStatus.COMPLETED.value
+        video.processing_stage = VideoGenerationStage.COMPLETED.value
         video.processing_completed_at = datetime.utcnow()
         video.progress_percent = 100
         video.duration_seconds = estimated_duration
         video.file_size_bytes = estimated_duration * 500000  # ~500KB per second
         # Set S3 key for generated video
-        video.output_video_key = f"generated-videos/{video.user_id}/{video_id}.mp4"
-        video.thumbnail_url = f"https://picsum.photos/seed/{video_id}/640/360"
+        video.output_video_key = f"generated-videos/{video.user_id}/{video.id}.mp4"
+        video.thumbnail_url = f"https://picsum.photos/seed/{video.id}/640/360"
 
         await db.commit()
-        logger.info(f"Video generation completed: {video_id}")
+
+        # Deduct credits based on actual video duration
+        await self._deduct_credits_for_video(video, db)
+
+        # Send email notification
+        await self._send_video_completion_email(video, db)
+
+        logger.info(f"Mock video generation completed: {video.id}")
 
     async def fail_video_model(
         self,

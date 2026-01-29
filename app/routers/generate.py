@@ -13,6 +13,7 @@ from app.models.voice_model import ModelStatus as VoiceModelStatus
 from app.models.generated_video import GenerationStatus
 from app.services.firebase import get_current_user
 from app.services.ai import ai_service
+from app.services.s3 import s3_service
 from app.services.usage_service import usage_service
 from app.schemas.generated_video import (
     GenerateVideoRequest,
@@ -109,7 +110,10 @@ async def generate_video(
     )
     queue_position = len(queue_result.scalars().all()) + 1
 
-    # Create generated video record
+    # Get current usage record for response (no deduction yet - will deduct after generation)
+    usage_record = await usage_service.get_or_create_current_usage(user.id, db)
+
+    # Create generated video record (credits_used will be set after generation completes)
     generated_video = GeneratedVideo(
         user_id=user.id,
         video_model_id=data.video_model_id,
@@ -118,16 +122,13 @@ async def generate_video(
         input_text=data.input_text,
         input_text_language=data.language,
         resolution=data.resolution,
-        credits_used=credits_needed,
+        credits_used=0,  # Will be updated with actual duration after generation
         status=GenerationStatus.QUEUED.value,
         queue_position=queue_position,
     )
     db.add(generated_video)
     await db.commit()
     await db.refresh(generated_video)
-
-    # Deduct credits
-    usage_record = await usage_service.deduct_credits(user.id, credits_needed, db)
 
     # Start generation in background
     background_tasks.add_task(
@@ -145,7 +146,7 @@ async def generate_video(
             status=generated_video.status,
             queue_position=generated_video.queue_position,
             estimated_duration_seconds=estimated_duration,
-            credits_used=generated_video.credits_used,
+            credits_used=credits_needed,  # Estimated - actual will be based on output duration
             created_at=generated_video.created_at,
         ),
         usage=UsageInfo(
@@ -197,14 +198,23 @@ async def get_generation_status(
             elapsed = 10  # Assume ~10 seconds have passed
             estimated_remaining = int(elapsed * (100 - video.progress_percent) / video.progress_percent)
 
+    # Generate presigned URL for completed videos
+    output_video_url = None
+    if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+        try:
+            output_video_url = await s3_service.generate_presigned_url(video.output_video_key)
+        except Exception:
+            pass
+
     return GenerationStatusResponse(
         video=GenerationStatusDetail(
             id=video.id,
             status=video.status,
+            processing_stage=video.processing_stage,
             queue_position=video.queue_position,
             progress_percent=video.progress_percent,
             estimated_remaining_seconds=estimated_remaining,
-            output_video_url=video.output_video_url,
+            output_video_url=output_video_url,
             thumbnail_url=video.thumbnail_url,
             duration_seconds=video.duration_seconds,
             file_size_bytes=video.file_size_bytes,

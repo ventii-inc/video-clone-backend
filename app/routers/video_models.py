@@ -1,38 +1,47 @@
 """Video models router for CRUD operations"""
 
 import asyncio
+import os
+import time
+from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.db import get_db
 from app.models import User, VideoModel
-from app.models.video_model import ModelStatus
+from app.models.video_model import ModelStatus, ProcessingStage
 from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
-from app.services.ai import ai_service
 from app.services.avatar_job import avatar_job_service
+from app.services.video import extract_thumbnail, video_service
+from app.services.livetalking.livetalking_config import LiveTalkingSettings
+from app.services.training_usage_service import training_usage_service
 from app.utils import logger
 from app.schemas.common import MessageResponse, PaginationMeta
 from app.schemas.video_model import (
-    VideoModelCreate,
     VideoModelResponse,
     VideoModelBrief,
     VideoModelListResponse,
     VideoModelUpdate,
-    VideoModelCreateResponse,
-    UploadCompleteRequest,
     AvatarReadyRequest,
+    DirectUploadResponse,
 )
-from app.schemas.common import UploadInfo
 
 router = APIRouter(prefix="/models/video", tags=["Video Models"])
 
 
 ALLOWED_VIDEO_TYPES = ["video/mp4", "video/quicktime", "video/x-msvideo", "video/webm"]
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+
+
+def map_public_status(status: str) -> str:
+    """Map internal status to public API status (processing/completed/failed)."""
+    if status in ("pending", "uploading", "processing"):
+        return "processing"
+    return status  # completed, failed stay the same
 
 
 @router.get("", response_model=VideoModelListResponse)
@@ -46,26 +55,77 @@ async def list_video_models(
     """
     List user's video models with optional status filter.
     """
-    # Build query
+    total_start = time.perf_counter()
+    timings = {}
+
+    # Build query - show all models for the user
     query = select(VideoModel).where(VideoModel.user_id == user.id)
 
     if status:
         query = query.where(VideoModel.status == status)
 
-    # Get total count
-    count_query = select(func.count()).select_from(query.subquery())
+    # Get total count - build count query directly with same filters (more efficient)
+    t0 = time.perf_counter()
+    count_query = select(func.count(VideoModel.id)).where(VideoModel.user_id == user.id)
+    if status:
+        count_query = count_query.where(VideoModel.status == status)
     total_result = await db.execute(count_query)
     total = total_result.scalar()
+    timings["count_query"] = (time.perf_counter() - t0) * 1000
 
     # Apply pagination
     query = query.order_by(VideoModel.created_at.desc())
     query = query.offset((page - 1) * limit).limit(limit)
 
+    t0 = time.perf_counter()
     result = await db.execute(query)
     models = result.scalars().all()
+    timings["main_query"] = (time.perf_counter() - t0) * 1000
+
+    # Generate presigned URLs for thumbnails in parallel
+    t0 = time.perf_counter()
+
+    # Create briefs first without URLs
+    model_briefs = []
+    models_with_thumbnails = []
+    for i, m in enumerate(models):
+        brief = VideoModelBrief.model_validate(m)
+        brief.status = map_public_status(m.status)
+        model_briefs.append(brief)
+        if m.thumbnail_key:
+            models_with_thumbnails.append((i, m.thumbnail_key))
+
+    # Generate all presigned URLs in parallel
+    if models_with_thumbnails:
+        thumbnail_tasks = [
+            s3_service.generate_presigned_url(key)
+            for _, key in models_with_thumbnails
+        ]
+        thumbnail_urls = await asyncio.gather(*thumbnail_tasks, return_exceptions=True)
+
+        # Assign URLs back to briefs
+        for (idx, _), url in zip(models_with_thumbnails, thumbnail_urls):
+            if isinstance(url, str):  # Not an exception
+                model_briefs[idx].thumbnail_url = url
+            else:
+                logger.warning(f"Failed to generate presigned URL: {url}")
+
+    timings["presigned_urls_total"] = (time.perf_counter() - t0) * 1000
+    timings["presigned_urls_count"] = len(models_with_thumbnails)
+
+    timings["total"] = (time.perf_counter() - total_start) * 1000
+
+    logger.info(
+        f"[PERF] list_video_models: "
+        f"count_query={timings['count_query']:.1f}ms, "
+        f"main_query={timings['main_query']:.1f}ms, "
+        f"presigned_urls_total={timings['presigned_urls_total']:.1f}ms "
+        f"(count={timings['presigned_urls_count']}, parallel), "
+        f"TOTAL={timings['total']:.1f}ms"
+    )
 
     return VideoModelListResponse(
-        models=[VideoModelBrief.model_validate(m) for m in models],
+        models=model_briefs,
         pagination=PaginationMeta(
             page=page,
             limit=limit,
@@ -98,153 +158,276 @@ async def get_video_model(
             detail="Video model not found",
         )
 
-    return VideoModelResponse.model_validate(model)
+    response = VideoModelResponse.model_validate(model)
+    # Generate thumbnail URL from thumbnail_key if available
+    if model.thumbnail_key:
+        response.thumbnail_url = await s3_service.generate_presigned_url(model.thumbnail_key)
+
+    return response
 
 
-@router.post("", response_model=VideoModelCreateResponse, status_code=status.HTTP_201_CREATED)
-async def create_video_model(
-    data: VideoModelCreate,
+@router.post("/upload", response_model=DirectUploadResponse, status_code=status.HTTP_201_CREATED)
+async def direct_upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Video file to upload"),
+    name: str = Form(..., min_length=1, max_length=100, description="Model name"),
+    duration_seconds: int = Form(..., gt=0, description="Video duration in seconds"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Create a new video model and get presigned upload URL.
+    Upload video directly to server and trigger avatar generation.
 
     Flow:
-    1. Create model record with 'pending' status
-    2. Generate presigned URL for S3 upload
-    3. Return model info and upload URL
-    4. Client uploads directly to S3
-    5. Client calls /upload-complete when done
+    1. Validate and save video file locally
+    2. Create model record
+    3. Trigger parallel background tasks:
+       - Upload video to S3
+       - Generate avatar (which uploads to S3 when complete)
     """
+    # Check training limit (bypass if user has flag set)
+    if not user.bypass_model_limit:
+        can_create, error_msg = await training_usage_service.can_create_video_model(
+            user.id, db
+        )
+        if not can_create:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_msg,
+            )
+
     # Validate content type
-    if data.content_type not in ALLOWED_VIDEO_TYPES:
+    if file.content_type not in ALLOWED_VIDEO_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid content type. Allowed: {', '.join(ALLOWED_VIDEO_TYPES)}",
         )
 
+    # Read file to get size and content
+    content = await file.read()
+    file_size = len(content)
+
     # Validate file size
-    if data.file_size_bytes > MAX_FILE_SIZE:
+    if file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB",
         )
 
-    # Create model record
+    # Create model record with initial progress
     model = VideoModel(
         user_id=user.id,
-        name=data.name,
-        file_size_bytes=data.file_size_bytes,
-        status=ModelStatus.PENDING.value,
+        name=name,
+        file_size_bytes=file_size,
+        duration_seconds=duration_seconds,
+        status=ModelStatus.UPLOADING.value,
+        progress_percent=5,  # 5% - File received, starting processing
+        processing_stage=ProcessingStage.UPLOADING.value,
     )
     db.add(model)
     await db.commit()
     await db.refresh(model)
 
-    # Generate S3 key and presigned URL
+    # Consume a video training slot (only if not bypassing limit)
+    if not user.bypass_model_limit:
+        await training_usage_service.consume_video_training(user.id, db)
+
+    # Save raw file locally (processing happens in background)
+    settings = LiveTalkingSettings()
+    Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
+
+    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
+
+    with open(local_path, "wb") as f:
+        f.write(content)
+
+    model.local_video_path = local_path
+    logger.info(f"Saved raw video: {local_path}")
+
+    # Generate S3 key for the video
     s3_key = s3_service.generate_s3_key(
         user_id=str(user.id),
-        filename=data.file_name,
+        filename=file.filename or f"{model.id}.mp4",
         media_type="training-videos",
         unique_id=str(model.id),
     )
-
-    presigned_url = await s3_service.generate_presigned_upload_url(
-        s3_key=s3_key,
-        content_type=data.content_type,
-        expires_in=3600,
-    )
-
-    # Store S3 key
     model.source_video_key = s3_key
     await db.commit()
 
-    return VideoModelCreateResponse(
+    # Background tasks: process video, create avatar job, S3 upload, thumbnail
+    # Avatar job is created AFTER video processing to avoid race condition
+    # where scheduler picks up job before video is processed
+    background_tasks.add_task(
+        process_upload_background_tasks,
+        model_id=model.id,
+        user_id=user.id,
+        local_path=local_path,
+        s3_key=s3_key,
+    )
+
+    return DirectUploadResponse(
         model=VideoModelBrief.model_validate(model),
-        upload=UploadInfo(
-            presigned_url=presigned_url,
-            s3_key=s3_key,
-            expires_in_seconds=3600,
-        ),
+        job_id=None,  # Job created in background after video processing
+        message="Video uploaded, processing started",
     )
 
 
-@router.post("/{model_id}/upload-complete", response_model=dict)
-async def complete_upload(
+async def process_upload_background_tasks(
     model_id: UUID,
-    data: UploadCompleteRequest,
-    background_tasks: BackgroundTasks,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    user_id: int,
+    local_path: str,
+    s3_key: str,
 ):
     """
-    Mark upload as complete and trigger AI processing.
+    Background task to process video, create avatar job, upload to S3, generate thumbnail,
+    and trigger avatar processing.
+
+    Flow:
+    1. Process video (trim 60s, 25fps, remove audio)
+    2. Create avatar job (AFTER video is processed to avoid race condition)
+    3. In parallel: upload to S3, generate thumbnail, trigger avatar processing
     """
-    result = await db.execute(
-        select(VideoModel).where(
-            VideoModel.id == model_id,
-            VideoModel.user_id == user.id,
-        )
-    )
-    model = result.scalar_one_or_none()
-
-    if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Video model not found",
-        )
-
-    if model.status != ModelStatus.PENDING.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot complete upload for model in '{model.status}' status",
-        )
-
-    # Verify file exists in S3
-    if model.source_video_key:
-        exists = await s3_service.file_exists(model.source_video_key)
-        if not exists:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Upload not found. Please upload the file first.",
-            )
-
-        # Get presigned URL for viewing
-        model.source_video_url = await s3_service.generate_presigned_url(model.source_video_key)
-
-    # Update model
-    model.duration_seconds = data.duration_seconds
-    model.status = ModelStatus.UPLOADING.value
-    await db.commit()
-
-    # Create avatar generation job
-    job = await avatar_job_service.create_job(
-        video_model_id=model.id,
-        user_id=user.id,
-        db=db,
-    )
-
-    logger.info(f"Created avatar job {job.id} for video model {model.id}")
-
-    # Process pending jobs (will trigger this job if slots available)
-    background_tasks.add_task(
-        process_avatar_jobs_task,
-    )
-
-    return {
-        "model": VideoModelBrief.model_validate(model).model_dump(),
-        "job_id": str(job.id),
-        "message": "Video uploaded, avatar generation job queued",
-    }
-
-
-async def process_avatar_jobs_task():
-    """Background task to process pending avatar jobs."""
     from app.db import get_db_session
 
-    async with get_db_session() as db:
-        await avatar_job_service.process_pending_jobs(db)
+    # Step 1: Process video first (required before S3 upload and avatar training)
+    raw_path = local_path  # local_path is the raw file
+    processed_path = local_path.replace("_raw", "")  # Remove _raw suffix for processed file
+
+    try:
+        _, processed_duration, _ = await video_service.process_training_video(raw_path, processed_path)
+        logger.info(f"Processed video: {processed_path} (duration: {processed_duration:.2f}s)")
+
+        # Update model with processed info
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.duration_seconds = int(processed_duration)
+                model.file_size_bytes = os.path.getsize(processed_path)
+                model.local_video_path = processed_path  # Update to processed path
+                await db.commit()
+
+        # Clean up raw file
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+    except Exception as e:
+        logger.error(f"Video processing failed for model {model_id}: {e}")
+        # Mark model as failed
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Video processing failed: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 2: Create avatar job NOW (after video is processed)
+    # This prevents race condition where scheduler picks up job before video processing completes
+    try:
+        async with get_db_session() as db:
+            job = await avatar_job_service.create_job(
+                video_model_id=model_id,
+                user_id=user_id,
+                db=db,
+            )
+            logger.info(f"Created avatar job {job.id} for video model {model_id}")
+    except Exception as e:
+        logger.error(f"Failed to create avatar job for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Failed to create avatar job: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 3: Run S3 upload, thumbnail generation, and avatar processing in parallel
+    async def upload_to_s3():
+        """Upload the processed video file to S3."""
+        try:
+            success = await s3_service.upload_file(processed_path, s3_key)
+            if success:
+                logger.info(f"S3 upload complete: {s3_key}")
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VideoModel).where(VideoModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.progress_percent = 10  # S3 upload done
+                        await db.commit()
+            else:
+                logger.error(f"S3 upload failed: {s3_key}")
+        except Exception as e:
+            logger.error(f"S3 upload error for model {model_id}: {e}")
+
+    async def generate_and_upload_thumbnail():
+        """Extract thumbnail from processed video and upload to S3."""
+        try:
+            thumbnail_path = await extract_thumbnail(processed_path, timestamp=1.0)
+            if not thumbnail_path:
+                logger.warning(f"Failed to extract thumbnail for model {model_id}")
+                return
+
+            thumbnail_s3_key = s3_service.generate_s3_key(
+                user_id=str(user_id),
+                filename=f"{model_id}.jpg",
+                media_type="thumbnails",
+                unique_id=str(model_id),
+            )
+
+            success = await s3_service.upload_file(
+                thumbnail_path, thumbnail_s3_key, content_type="image/jpeg"
+            )
+
+            if success:
+                logger.info(f"Thumbnail uploaded: {thumbnail_s3_key}")
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VideoModel).where(VideoModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.thumbnail_key = thumbnail_s3_key
+                        await db.commit()
+            else:
+                logger.error(f"Thumbnail upload failed: {thumbnail_s3_key}")
+
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                os.remove(thumbnail_path)
+
+        except Exception as e:
+            logger.error(f"Thumbnail generation error for model {model_id}: {e}")
+
+    async def trigger_avatar_processing():
+        """Trigger avatar generation job processing."""
+        try:
+            async with get_db_session() as db:
+                await avatar_job_service.process_pending_jobs(db)
+        except Exception as e:
+            logger.error(f"Avatar processing trigger error for model {model_id}: {e}")
+
+    task_names = ["upload_to_s3", "generate_thumbnail", "trigger_avatar_processing"]
+    results = await asyncio.gather(
+        upload_to_s3(),
+        generate_and_upload_thumbnail(),
+        trigger_avatar_processing(),
+        return_exceptions=True,
+    )
+
+    for name, result in zip(task_names, results):
+        if isinstance(result, Exception):
+            logger.error(f"Background task '{name}' failed for model {model_id}: {result}")
 
 
 @router.post("/{model_id}/avatar-ready", response_model=dict)
@@ -289,9 +472,11 @@ async def avatar_ready(
             detail="Avatar TAR file not found in S3",
         )
 
-    # Update model with avatar data
+    # Update model with avatar data and progress
     model.model_data_key = data.s3_key
     model.status = ModelStatus.COMPLETED.value
+    model.progress_percent = 100
+    model.processing_stage = ProcessingStage.COMPLETED.value
     model.processing_completed_at = datetime.utcnow()
     await db.commit()
 
@@ -359,8 +544,12 @@ async def delete_video_model(
             detail="Video model not found",
         )
 
-    # Check if model has generated videos
-    if model.generated_videos and len(model.generated_videos) > 0:
+    # Check if model has generated videos (use count query to avoid lazy loading)
+    from app.models import GeneratedVideo
+    video_count_result = await db.execute(
+        select(func.count(GeneratedVideo.id)).where(GeneratedVideo.video_model_id == model_id)
+    )
+    if video_count_result.scalar() > 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete model that has generated videos",

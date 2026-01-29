@@ -1,13 +1,21 @@
-"""Billing router - Placeholder stubs for Stripe integration"""
+"""Billing router for Stripe integration"""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 
+import stripe
+
 from app.db import get_db
 from app.models import User, Subscription
+from app.models.subscription import SubscriptionStatus
 from app.services.firebase import get_current_user
+from app.services.stripe import stripe_service, stripe_settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
 
@@ -28,33 +36,34 @@ class PurchaseMinutesRequest(BaseModel):
     cancel_url: str
 
 
+class ShotPlanRequest(BaseModel):
+    success_url: str
+    cancel_url: str
+
+
 @router.get("/subscription")
 async def get_subscription(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get current subscription details.
-
-    Returns mock data for now until Stripe is integrated.
+    Get current subscription details including default payment method.
     """
     result = await db.execute(
         select(Subscription).where(Subscription.user_id == user.id)
     )
     subscription = result.scalar_one_or_none()
 
-    if not subscription:
-        # Return default free subscription
+    # Get payment method if user has a Stripe customer
+    payment_method = None
+    if subscription and subscription.stripe_customer_id:
+        payment_method = await stripe_service.get_default_payment_method(user, db)
+
+    # Treat incomplete subscriptions as non-existent (customer created but no payment)
+    if not subscription or subscription.status == SubscriptionStatus.INCOMPLETE.value:
         return {
-            "subscription": {
-                "plan_type": "free",
-                "status": "active",
-                "monthly_minutes_limit": 0,
-                "current_period_start": None,
-                "current_period_end": None,
-                "cancel_at_period_end": False,
-            },
-            "payment_method": None,
+            "subscription": None,
+            "payment_method": payment_method,
         }
 
     return {
@@ -62,11 +71,19 @@ async def get_subscription(
             "plan_type": subscription.plan_type,
             "status": subscription.status,
             "monthly_minutes_limit": subscription.monthly_minutes_limit,
-            "current_period_start": subscription.current_period_start.isoformat() if subscription.current_period_start else None,
-            "current_period_end": subscription.current_period_end.isoformat() if subscription.current_period_end else None,
+            "current_period_start": (
+                subscription.current_period_start.isoformat()
+                if subscription.current_period_start
+                else None
+            ),
+            "current_period_end": (
+                subscription.current_period_end.isoformat()
+                if subscription.current_period_end
+                else None
+            ),
             "cancel_at_period_end": subscription.canceled_at is not None,
         },
-        "payment_method": None,  # TODO: Fetch from Stripe
+        "payment_method": payment_method,
     }
 
 
@@ -74,58 +91,161 @@ async def get_subscription(
 async def create_checkout_session(
     data: CheckoutRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Create Stripe checkout session for subscription.
+    Create Stripe Checkout session for subscription.
 
-    NOT IMPLEMENTED - Returns 501.
+    Returns checkout URL to redirect user to Stripe.
     """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Stripe integration not yet implemented. Coming soon!",
-    )
+    try:
+        checkout_url = await stripe_service.create_checkout_session(
+            user=user,
+            success_url=data.success_url,
+            cancel_url=data.cancel_url,
+            db=db,
+        )
+        return {"checkout_url": checkout_url}
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+    except stripe.StripeError as e:
+        logger.error(f"Stripe error creating checkout session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment service error. Please try again.",
+        )
 
 
 @router.post("/portal")
 async def create_portal_session(
     data: PortalRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Create Stripe customer portal session.
+    Create Stripe Customer Portal session.
 
-    NOT IMPLEMENTED - Returns 501.
+    Returns portal URL for managing subscription.
     """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Stripe integration not yet implemented. Coming soon!",
-    )
+    try:
+        portal_url = await stripe_service.create_portal_session(
+            user=user,
+            return_url=data.return_url,
+            db=db,
+        )
+        return {"portal_url": portal_url}
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+    except stripe.StripeError as e:
+        logger.error(f"Stripe error creating portal session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment service error. Please try again.",
+        )
 
 
 @router.post("/purchase-minutes")
 async def purchase_additional_minutes(
     data: PurchaseMinutesRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Purchase additional minutes.
 
-    NOT IMPLEMENTED - Returns 501.
+    Each unit = 20 minutes = ¥1,000
+    Returns checkout URL to redirect user to Stripe.
     """
-    # Calculate amounts
-    minutes_to_add = data.quantity * 20
-    amount_jpy = data.quantity * 1000
+    if data.quantity < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Quantity must be at least 1",
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "message": "Stripe integration not yet implemented. Coming soon!",
+    if data.quantity > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum quantity is 100 units per purchase",
+        )
+
+    try:
+        checkout_url = await stripe_service.create_minutes_checkout_session(
+            user=user,
+            quantity=data.quantity,
+            success_url=data.success_url,
+            cancel_url=data.cancel_url,
+            db=db,
+        )
+
+        minutes_to_add = data.quantity * stripe_settings.minutes_pack_quantity
+        amount_jpy = data.quantity * stripe_settings.minutes_pack_price_jpy
+
+        return {
+            "checkout_url": checkout_url,
             "preview": {
                 "minutes_to_add": minutes_to_add,
                 "amount_jpy": amount_jpy,
             },
-        },
-    )
+        }
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+    except stripe.StripeError as e:
+        logger.error(f"Stripe error creating minutes checkout: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment service error. Please try again.",
+        )
+
+
+@router.post("/checkout/shot")
+async def create_shot_plan_checkout(
+    data: ShotPlanRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create Stripe Checkout session for Shot plan one-time purchase.
+
+    Shot plan: ¥980 for 10 minutes + 1 video training + 1 voice training.
+    Credits never expire.
+    """
+    try:
+        checkout_url = await stripe_service.create_shot_plan_checkout_session(
+            user=user,
+            success_url=data.success_url,
+            cancel_url=data.cancel_url,
+            db=db,
+        )
+
+        return {
+            "checkout_url": checkout_url,
+            "preview": {
+                "minutes_to_add": stripe_settings.shot_plan_minutes,
+                "video_trainings": stripe_settings.shot_plan_video_trainings,
+                "voice_trainings": stripe_settings.shot_plan_voice_trainings,
+                "amount_jpy": stripe_settings.shot_plan_price_jpy,
+            },
+        }
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+    except stripe.StripeError as e:
+        logger.error(f"Stripe error creating Shot plan checkout: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment service error. Please try again.",
+        )
 
 
 @router.get("/invoices")
@@ -133,31 +253,139 @@ async def get_invoices(
     page: int = 1,
     limit: int = 10,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Get payment/invoice history.
-
-    Returns empty list until Stripe is integrated.
+    Get payment/invoice history from Stripe.
     """
+    if limit > 100:
+        limit = 100
+
+    invoices = await stripe_service.get_invoices(user, limit, db)
+
+    # Simple pagination (Stripe handles this differently, but keeping API compatible)
+    start = (page - 1) * limit
+    end = start + limit
+    paginated = invoices[start:end]
+
     return {
-        "invoices": [],
+        "invoices": paginated,
         "pagination": {
             "page": page,
             "limit": limit,
-            "total": 0,
-            "total_pages": 0,
+            "total": len(invoices),
+            "total_pages": (len(invoices) + limit - 1) // limit if invoices else 0,
         },
     }
 
 
 @router.post("/webhooks/stripe")
-async def stripe_webhook():
+async def stripe_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
     """
     Stripe webhook endpoint.
 
-    NOT IMPLEMENTED - Placeholder.
+    Handles events from Stripe to update subscription status.
     """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Stripe webhook not yet implemented",
-    )
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature")
+
+    if not signature:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing stripe-signature header",
+        )
+
+    try:
+        event = stripe_service.construct_webhook_event(payload, signature)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid payload",
+        )
+    except stripe.SignatureVerificationError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid signature",
+        )
+
+    logger.info(f"Received Stripe webhook: {event.type}")
+
+    try:
+        if event.type == "checkout.session.completed":
+            await stripe_service.handle_checkout_completed(event.data.object, db)
+
+        elif event.type == "customer.subscription.updated":
+            await stripe_service.handle_subscription_updated(event.data.object, db)
+
+        elif event.type == "customer.subscription.deleted":
+            await stripe_service.handle_subscription_deleted(event.data.object, db)
+
+        elif event.type == "invoice.paid":
+            await stripe_service.handle_invoice_paid(event.data.object, db)
+
+        elif event.type == "invoice.payment_failed":
+            await stripe_service.handle_invoice_payment_failed(event.data.object, db)
+
+        elif event.type == "customer.updated":
+            await stripe_service.handle_customer_updated(event.data.object, db)
+
+        else:
+            logger.debug(f"Unhandled webhook event type: {event.type}")
+
+    except Exception as e:
+        logger.error(f"Error handling webhook {event.type}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Webhook processing error: {str(e)}",
+        )
+
+    return {"status": "success"}
+
+
+@router.get("/prices")
+async def get_prices():
+    """
+    Get current pricing information for all plans.
+
+    Public endpoint - no authentication required.
+    """
+    return {
+        "free": {
+            "name": "Free Plan",
+            "price_jpy": 0,
+            "minutes": 3,
+            "video_trainings": 1,
+            "voice_trainings": 1,
+            "is_lifetime": True,
+            "description": "Lifetime allowance - never resets",
+        },
+        "shot": {
+            "name": "Shot Plan",
+            "price_jpy": stripe_settings.shot_plan_price_jpy,
+            "minutes": stripe_settings.shot_plan_minutes,
+            "video_trainings": stripe_settings.shot_plan_video_trainings,
+            "voice_trainings": stripe_settings.shot_plan_voice_trainings,
+            "billing_period": "one_time",
+            "never_expires": True,
+            "description": "One-time purchase - credits never expire",
+        },
+        "standard": {
+            "name": "Standard Plan",
+            "price_jpy": stripe_settings.subscription_monthly_price_jpy,
+            "minutes_per_month": stripe_settings.subscription_monthly_minutes,
+            "video_trainings_per_month": 5,
+            "voice_trainings_per_month": 5,
+            "billing_period": "monthly",
+            "auto_charge_enabled": True,
+            "description": "Monthly subscription with auto-charge",
+        },
+        "minutes_pack": {
+            "name": "Additional Minutes",
+            "price_jpy": stripe_settings.minutes_pack_price_jpy,
+            "minutes": stripe_settings.minutes_pack_quantity,
+            "bonus_trainings": stripe_settings.auto_charge_bonus_trainings,
+        },
+    }

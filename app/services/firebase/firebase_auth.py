@@ -1,5 +1,6 @@
 """Firebase authentication middleware and utilities"""
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -28,7 +29,7 @@ class TokenData:
 
 def verify_token(id_token: str) -> TokenData:
     """
-    Verify a Firebase ID token and extract user data.
+    Verify a Firebase ID token and extract user data (synchronous version).
 
     Args:
         id_token: The Firebase ID token to verify
@@ -44,6 +45,45 @@ def verify_token(id_token: str) -> TokenData:
 
     try:
         decoded_token = auth.verify_id_token(id_token)
+
+        return TokenData(
+            uid=decoded_token["uid"],
+            email=decoded_token.get("email"),
+            name=decoded_token.get("name"),
+            email_verified=decoded_token.get("email_verified", False),
+        )
+    except auth.ExpiredIdTokenError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except auth.RevokedIdTokenError:
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+    except auth.InvalidIdTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except Exception as e:
+        logger.error(f"Token verification failed: {e}")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
+
+async def verify_token_async(id_token: str) -> TokenData:
+    """
+    Verify a Firebase ID token and extract user data (non-blocking async version).
+
+    Uses asyncio.to_thread() to avoid blocking the event loop during
+    the synchronous Firebase SDK call.
+
+    Args:
+        id_token: The Firebase ID token to verify
+
+    Returns:
+        TokenData: The decoded token data
+
+    Raises:
+        HTTPException: If token verification fails
+    """
+    # Ensure Firebase is initialized
+    get_firebase_app()
+
+    try:
+        decoded_token = await asyncio.to_thread(auth.verify_id_token, id_token)
 
         return TokenData(
             uid=decoded_token["uid"],
@@ -98,7 +138,7 @@ async def get_current_user(
 
     This dependency:
     1. Extracts the Bearer token from the Authorization header
-    2. Verifies the token with Firebase
+    2. Verifies the token with Firebase (non-blocking)
     3. Looks up or creates the user in the database
     4. Returns the User object
 
@@ -113,7 +153,7 @@ async def get_current_user(
         HTTPException: If authentication fails or user not found
     """
     token = get_token_from_header(request)
-    token_data = verify_token(token)
+    token_data = await verify_token_async(token)
 
     if not token_data.email:
         raise HTTPException(
@@ -160,7 +200,7 @@ async def get_current_user_or_create(
         HTTPException: If authentication fails
     """
     token = get_token_from_header(request)
-    token_data = verify_token(token)
+    token_data = await verify_token_async(token)
 
     if not token_data.email:
         raise HTTPException(
@@ -216,7 +256,7 @@ async def get_optional_user(
 
     try:
         token = auth_header.split("Bearer ")[1]
-        token_data = verify_token(token)
+        token_data = await verify_token_async(token)
 
         if not token_data.email:
             return None

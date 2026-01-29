@@ -1,5 +1,6 @@
 """Generated videos router for managing generated videos"""
 
+import asyncio
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
@@ -70,29 +71,37 @@ async def list_videos(
     else:
         query = query.order_by(sort_column.desc())
 
-    # Apply pagination and eager load relationships
-    query = query.options(
-        selectinload(GeneratedVideo.video_model),
-        selectinload(GeneratedVideo.voice_model),
-    )
+    # Apply pagination
     query = query.offset((page - 1) * limit).limit(limit)
 
     result = await db.execute(query)
     videos = result.scalars().all()
 
-    # Build response
+    # Generate presigned URLs in parallel for completed videos
+    async def get_presigned_url(video):
+        if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+            try:
+                return await s3_service.generate_presigned_url(video.output_video_key)
+            except Exception:
+                return None
+        return None
+
+    urls = await asyncio.gather(*[get_presigned_url(v) for v in videos])
+
+    # Build response with URLs
     items = []
-    for video in videos:
+    for video, url in zip(videos, urls):
         items.append(
             GeneratedVideoListItem(
                 id=video.id,
                 title=video.title,
                 thumbnail_url=video.thumbnail_url,
+                output_video_url=url,
                 duration_seconds=video.duration_seconds,
                 resolution=video.resolution,
                 status=video.status,
-                video_model=VideoModelBrief.model_validate(video.video_model) if video.video_model else None,
-                voice_model=VoiceModelBrief.model_validate(video.voice_model) if video.voice_model else None,
+                video_model_id=video.video_model_id,
+                voice_model_id=video.voice_model_id,
                 created_at=video.created_at,
             )
         )
@@ -136,18 +145,28 @@ async def get_video(
             detail="Generated video not found",
         )
 
+    # Generate fresh presigned URL for completed videos
+    output_video_url = None
+    if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+        try:
+            output_video_url = await s3_service.generate_presigned_url(video.output_video_key)
+        except Exception:
+            pass
+
     return GeneratedVideoResponse(
         id=video.id,
         title=video.title,
         input_text=video.input_text,
         input_text_language=video.input_text_language,
-        output_video_url=video.output_video_url,
+        output_video_url=output_video_url,
         thumbnail_url=video.thumbnail_url,
         duration_seconds=video.duration_seconds,
         file_size_bytes=video.file_size_bytes,
         resolution=video.resolution,
         credits_used=video.credits_used,
         status=video.status,
+        processing_stage=video.processing_stage,
+        progress_percent=video.progress_percent,
         error_message=video.error_message,
         video_model=VideoModelBrief.model_validate(video.video_model) if video.video_model else None,
         voice_model=VoiceModelBrief.model_validate(video.voice_model) if video.voice_model else None,
@@ -192,15 +211,16 @@ async def get_download_url(
             detail="Video file not found",
         )
 
-    # Generate fresh presigned URL
-    download_url = await s3_service.generate_presigned_url(
-        video.output_video_key,
-        expires_in=3600,
-    )
-
     # Generate filename
     title_slug = (video.title or "video").lower().replace(" ", "-")[:50]
     filename = f"{title_slug}-{str(video.id)[:8]}.mp4"
+
+    # Generate fresh presigned URL with Content-Disposition header for download
+    download_url = await s3_service.generate_presigned_url(
+        video.output_video_key,
+        expiration=3600,
+        content_disposition=f'attachment; filename="{filename}"',
+    )
 
     return DownloadUrlResponse(
         download_url=download_url,
@@ -288,7 +308,10 @@ async def regenerate_video(
             },
         )
 
-    # Create new video record
+    # Get current usage record for response (no deduction yet - will deduct after generation)
+    usage_record = await usage_service.get_or_create_current_usage(user.id, db)
+
+    # Create new video record (credits_used will be set after generation completes)
     new_video = GeneratedVideo(
         user_id=user.id,
         video_model_id=original.video_model_id,
@@ -297,16 +320,13 @@ async def regenerate_video(
         input_text=original.input_text,
         input_text_language=original.input_text_language,
         resolution=original.resolution,
-        credits_used=credits_needed,
+        credits_used=0,  # Will be updated with actual duration after generation
         status=GenerationStatus.QUEUED.value,
         queue_position=1,
     )
     db.add(new_video)
     await db.commit()
     await db.refresh(new_video)
-
-    # Deduct credits
-    usage_record = await usage_service.deduct_credits(user.id, credits_needed, db)
 
     # Start generation
     background_tasks.add_task(
@@ -320,7 +340,7 @@ async def regenerate_video(
             title=new_video.title,
             status=new_video.status,
             queue_position=new_video.queue_position,
-            credits_used=new_video.credits_used,
+            credits_used=credits_needed,  # Estimated - actual will be based on output duration
             created_at=new_video.created_at,
         ),
         usage=UsageInfo(

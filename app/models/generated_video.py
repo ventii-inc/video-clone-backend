@@ -18,6 +18,15 @@ class GenerationStatus(str, PyEnum):
     FAILED = "failed"
 
 
+class VideoGenerationStage(str, PyEnum):
+    """Stages of video generation for progress tracking"""
+    QUEUED = "queued"           # 0-10% - Waiting to start
+    PREPARING = "preparing"     # 10-20% - Loading models, setting up
+    GENERATING = "generating"   # 20-80% - TTS + lip-sync (asymptotic)
+    COMPLETED = "completed"     # 100% - Done
+    FAILED = "failed"           # Error state
+
+
 class Resolution(str, PyEnum):
     HD = "720p"
     FULL_HD = "1080p"
@@ -43,9 +52,11 @@ class GeneratedVideo(Base):
     file_size_bytes = Column(Integer, nullable=True)
     credits_used = Column(Integer, default=0, nullable=False)  # Minutes consumed
     status = Column(String(20), default=GenerationStatus.QUEUED.value, nullable=False, index=True)
+    processing_stage = Column(String(20), default=VideoGenerationStage.QUEUED.value, nullable=False)
     error_message = Column(Text, nullable=True)
+    output_file = Column(String(500), nullable=True)  # Path to CLI output log file
     queue_position = Column(Integer, nullable=True)
-    progress_percent = Column(Integer, nullable=True)
+    progress_percent = Column(Integer, default=0, nullable=False)
     processing_started_at = Column(DateTime, nullable=True)
     processing_completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
