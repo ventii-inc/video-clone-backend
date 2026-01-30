@@ -37,6 +37,7 @@ from app.routers import (
     avatar_backend_router,
 )
 from app.services.scheduler import scheduler_service
+from app.services.firebase import initialize_firebase, is_firebase_initialized
 
 # Initialize Sentry for error tracking (only in non-debug environments)
 sentry_enabled = configure_sentry()
@@ -44,10 +45,30 @@ if sentry_enabled:
     logger.info("Sentry error tracking initialized")
 
 
+async def prewarm_firebase():
+    """Pre-warm Firebase by fetching Google's public keys."""
+    import asyncio
+    from firebase_admin import auth
+    try:
+        # Make a dummy verification call to force fetching public keys
+        # This will fail but triggers the key fetch and caches them
+        await asyncio.to_thread(auth.verify_id_token, "dummy_token")
+    except Exception:
+        pass  # Expected to fail, we just want to cache the keys
+    logger.info("Firebase public keys pre-warmed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler for startup/shutdown events."""
     # Startup
+    logger.info("Initializing Firebase...")
+    try:
+        initialize_firebase()
+        await prewarm_firebase()
+    except Exception as e:
+        logger.warning(f"Firebase initialization failed: {e}")
+
     logger.info("Starting background scheduler...")
     await scheduler_service.start()
 
