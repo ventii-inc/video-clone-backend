@@ -41,6 +41,96 @@ class ShotPlanRequest(BaseModel):
     cancel_url: str
 
 
+class ManageBillingRequest(BaseModel):
+    return_url: str
+    success_url: str | None = None  # Only needed for checkout
+    cancel_url: str | None = None  # Only needed for checkout
+
+
+@router.post("/manage")
+async def manage_billing(
+    data: ManageBillingRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Unified billing management endpoint.
+
+    Returns checkout URL for free users, portal URL for subscribers.
+    """
+    # Get subscription
+    result = await db.execute(
+        select(Subscription).where(Subscription.user_id == user.id)
+    )
+    subscription = result.scalar_one_or_none()
+
+    # Check if user has active Stripe subscription
+    has_stripe_subscription = (
+        subscription
+        and subscription.stripe_subscription_id
+        and subscription.status
+        in [
+            SubscriptionStatus.ACTIVE.value,
+            SubscriptionStatus.PAST_DUE.value,
+        ]
+    )
+
+    if has_stripe_subscription:
+        # Existing subscriber - return portal
+        try:
+            portal_url = await stripe_service.create_portal_session(
+                user=user,
+                return_url=data.return_url,
+                db=db,
+            )
+            return {
+                "type": "portal",
+                "url": portal_url,
+                "message": "Manage your subscription",
+            }
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(e),
+            )
+        except stripe.StripeError as e:
+            logger.error(f"Stripe error creating portal session: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Payment service error. Please try again.",
+            )
+    else:
+        # Free/no subscription - return checkout
+        if not data.success_url or not data.cancel_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="success_url and cancel_url required for checkout",
+            )
+        try:
+            checkout_url = await stripe_service.create_checkout_session(
+                user=user,
+                success_url=data.success_url,
+                cancel_url=data.cancel_url,
+                db=db,
+            )
+            return {
+                "type": "checkout",
+                "url": checkout_url,
+                "message": "Subscribe to a plan",
+            }
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(e),
+            )
+        except stripe.StripeError as e:
+            logger.error(f"Stripe error creating checkout session: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Payment service error. Please try again.",
+            )
+
+
 @router.get("/subscription")
 async def get_subscription(
     user: User = Depends(get_current_user),
