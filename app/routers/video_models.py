@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from uuid import UUID
 
+import aiofiles
+
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -203,15 +205,37 @@ async def direct_upload_video(
             detail=f"Invalid content type. Allowed: {', '.join(ALLOWED_VIDEO_TYPES)}",
         )
 
-    # Read file to get size and content
-    content = await file.read()
-    file_size = len(content)
+    # Prepare local path for streaming
+    settings = LiveTalkingSettings()
+    Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
 
-    # Validate file size
-    if file_size > MAX_FILE_SIZE:
+    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
+    temp_filename = f"temp_{user.id}_{int(time.time())}{ext}"
+    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, temp_filename)
+
+    # Stream file directly to disk (async) to avoid memory bloat
+    file_size = 0
+    chunk_size = 1024 * 1024  # 1MB chunks
+    try:
+        async with aiofiles.open(local_path, "wb") as f:
+            while chunk := await file.read(chunk_size):
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    await f.close()
+                    os.unlink(local_path)
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB",
+                    )
+                await f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if os.path.exists(local_path):
+            os.unlink(local_path)
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024*1024)}MB",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save uploaded file: {str(e)}",
         )
 
     # Create model record with initial progress
@@ -232,15 +256,10 @@ async def direct_upload_video(
     if not user.bypass_model_limit:
         await training_usage_service.consume_video_training(user.id, db)
 
-    # Save raw file locally (processing happens in background)
-    settings = LiveTalkingSettings()
-    Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
-
-    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
-
-    with open(local_path, "wb") as f:
-        f.write(content)
+    # Rename temp file to final path with model ID
+    final_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
+    os.rename(local_path, final_path)
+    local_path = final_path
 
     model.local_video_path = local_path
     logger.info(f"Saved raw video: {local_path}")
