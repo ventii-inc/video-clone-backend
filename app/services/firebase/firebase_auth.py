@@ -152,8 +152,14 @@ async def get_current_user(
     Raises:
         HTTPException: If authentication fails or user not found
     """
+    import time
+    total_start = time.perf_counter()
+
     token = get_token_from_header(request)
+
+    t0 = time.perf_counter()
     token_data = await verify_token_async(token)
+    firebase_verify_time = (time.perf_counter() - t0) * 1000
 
     if not token_data.email:
         raise HTTPException(
@@ -161,8 +167,10 @@ async def get_current_user(
         )
 
     # Look up user by Firebase UID
+    t0 = time.perf_counter()
     result = await db.execute(select(User).where(User.firebase_uid == token_data.uid))
     user = result.scalar_one_or_none()
+    db_query_time = (time.perf_counter() - t0) * 1000
 
     if not user:
         # Check if user exists by email (could have been created differently)
@@ -177,6 +185,14 @@ async def get_current_user(
             raise HTTPException(
                 status_code=404, detail="User not found. Please register first."
             )
+
+    total_time = (time.perf_counter() - total_start) * 1000
+    logger.info(
+        f"[PERF] get_current_user: "
+        f"firebase_verify={firebase_verify_time:.1f}ms, "
+        f"db_query={db_query_time:.1f}ms, "
+        f"TOTAL={total_time:.1f}ms"
+    )
 
     return user
 

@@ -187,7 +187,11 @@ async def direct_upload_video(
        - Upload video to S3
        - Generate avatar (which uploads to S3 when complete)
     """
+    total_start = time.perf_counter()
+    timings = {}
+
     # Check training limit (bypass if user has flag set)
+    t0 = time.perf_counter()
     if not user.bypass_model_limit:
         can_create, error_msg = await training_usage_service.can_create_video_model(
             user.id, db
@@ -197,6 +201,7 @@ async def direct_upload_video(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=error_msg,
             )
+    timings["training_limit_check"] = (time.perf_counter() - t0) * 1000
 
     # Validate content type
     if file.content_type not in ALLOWED_VIDEO_TYPES:
@@ -214,6 +219,7 @@ async def direct_upload_video(
     local_path = os.path.join(settings.VIDEO_LOCAL_PATH, temp_filename)
 
     # Stream file directly to disk (async) to avoid memory bloat
+    t0 = time.perf_counter()
     file_size = 0
     chunk_size = 1024 * 1024  # 1MB chunks
     try:
@@ -237,8 +243,11 @@ async def direct_upload_video(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save uploaded file: {str(e)}",
         )
+    timings["file_stream_to_disk"] = (time.perf_counter() - t0) * 1000
+    timings["file_size_mb"] = file_size / (1024 * 1024)
 
     # Create model record with initial progress
+    t0 = time.perf_counter()
     model = VideoModel(
         user_id=user.id,
         name=name,
@@ -251,10 +260,13 @@ async def direct_upload_video(
     db.add(model)
     await db.commit()
     await db.refresh(model)
+    timings["create_model_record"] = (time.perf_counter() - t0) * 1000
 
     # Consume a video training slot (only if not bypassing limit)
+    t0 = time.perf_counter()
     if not user.bypass_model_limit:
         await training_usage_service.consume_video_training(user.id, db)
+    timings["consume_training"] = (time.perf_counter() - t0) * 1000
 
     # Rename temp file to final path with model ID
     final_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
@@ -262,9 +274,9 @@ async def direct_upload_video(
     local_path = final_path
 
     model.local_video_path = local_path
-    logger.info(f"Saved raw video: {local_path}")
 
     # Generate S3 key for the video
+    t0 = time.perf_counter()
     s3_key = s3_service.generate_s3_key(
         user_id=str(user.id),
         filename=file.filename or f"{model.id}.mp4",
@@ -273,6 +285,19 @@ async def direct_upload_video(
     )
     model.source_video_key = s3_key
     await db.commit()
+    timings["save_s3_key"] = (time.perf_counter() - t0) * 1000
+
+    timings["total"] = (time.perf_counter() - total_start) * 1000
+
+    logger.info(
+        f"[PERF] direct_upload_video: "
+        f"training_check={timings['training_limit_check']:.1f}ms, "
+        f"file_stream={timings['file_stream_to_disk']:.1f}ms ({timings['file_size_mb']:.1f}MB), "
+        f"create_model={timings['create_model_record']:.1f}ms, "
+        f"consume_training={timings['consume_training']:.1f}ms, "
+        f"save_s3_key={timings['save_s3_key']:.1f}ms, "
+        f"TOTAL={timings['total']:.1f}ms"
+    )
 
     # Background tasks: process video, create avatar job, S3 upload, thumbnail
     # Avatar job is created AFTER video processing to avoid race condition
