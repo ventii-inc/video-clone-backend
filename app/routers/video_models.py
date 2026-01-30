@@ -30,6 +30,9 @@ from app.schemas.video_model import (
     VideoModelUpdate,
     AvatarReadyRequest,
     DirectUploadResponse,
+    UploadInitRequest,
+    UploadInitResponse,
+    UploadCompleteRequest,
 )
 
 router = APIRouter(prefix="/models/video", tags=["Video Models"])
@@ -37,6 +40,12 @@ router = APIRouter(prefix="/models/video", tags=["Video Models"])
 
 ALLOWED_VIDEO_TYPES = ["video/mp4", "video/quicktime", "video/x-msvideo", "video/webm"]
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+PRESIGNED_URL_EXPIRATION = 300  # 5 minutes
+
+
+def get_upload_mode() -> str:
+    """Get upload mode from environment. Options: 'direct_s3' (default) or 'server'"""
+    return os.environ.get("UPLOAD_MODE", "direct_s3")
 
 
 def map_public_status(status: str) -> str:
@@ -180,6 +189,9 @@ async def direct_upload_video(
     """
     Upload video directly to server and trigger avatar generation.
 
+    Note: When UPLOAD_MODE=direct_s3 (default), use /upload/init and /upload/complete instead.
+    This endpoint is for UPLOAD_MODE=server (legacy mode).
+
     Flow:
     1. Validate and save video file locally
     2. Create model record
@@ -187,6 +199,13 @@ async def direct_upload_video(
        - Upload video to S3
        - Generate avatar (which uploads to S3 when complete)
     """
+    # Check upload mode - reject if direct_s3 mode is enabled
+    if get_upload_mode() == "direct_s3":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Direct server upload is disabled. Use /upload/init and /upload/complete for direct S3 upload.",
+        )
+
     total_start = time.perf_counter()
     timings = {}
 
@@ -315,6 +334,378 @@ async def direct_upload_video(
         job_id=None,  # Job created in background after video processing
         message="Video uploaded, processing started",
     )
+
+
+@router.post("/upload/init", response_model=UploadInitResponse, status_code=status.HTTP_201_CREATED)
+async def init_upload(
+    data: UploadInitRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Initialize a direct S3 upload and get a presigned URL.
+
+    This is the first step in the direct S3 upload flow:
+    1. Client calls this endpoint to get a presigned S3 URL
+    2. Client uploads the video directly to S3 using the presigned URL
+    3. Client calls /upload/complete to notify the server and start processing
+
+    This bypasses the slow RunPod network by having clients upload directly to S3.
+    """
+    total_start = time.perf_counter()
+    timings = {}
+
+    # Check training limit (bypass if user has flag set)
+    t0 = time.perf_counter()
+    if not user.bypass_model_limit:
+        can_create, error_msg = await training_usage_service.can_create_video_model(
+            user.id, db
+        )
+        if not can_create:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_msg,
+            )
+    timings["training_limit_check"] = (time.perf_counter() - t0) * 1000
+
+    # Validate content type
+    if data.content_type not in ALLOWED_VIDEO_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid content type. Allowed: {', '.join(ALLOWED_VIDEO_TYPES)}",
+        )
+
+    # Create model record with initial progress
+    t0 = time.perf_counter()
+    model = VideoModel(
+        user_id=user.id,
+        name=data.name,
+        status=ModelStatus.UPLOADING.value,
+        progress_percent=0,
+        processing_stage=ProcessingStage.UPLOADING.value,
+    )
+    db.add(model)
+    await db.commit()
+    await db.refresh(model)
+    timings["create_model_record"] = (time.perf_counter() - t0) * 1000
+
+    # Consume a video training slot (only if not bypassing limit)
+    t0 = time.perf_counter()
+    if not user.bypass_model_limit:
+        await training_usage_service.consume_video_training(user.id, db)
+    timings["consume_training"] = (time.perf_counter() - t0) * 1000
+
+    # Generate S3 key and presigned upload URL
+    t0 = time.perf_counter()
+    ext = ".mp4"  # Default extension, will be validated on complete
+    if data.content_type == "video/quicktime":
+        ext = ".mov"
+    elif data.content_type == "video/webm":
+        ext = ".webm"
+    elif data.content_type == "video/x-msvideo":
+        ext = ".avi"
+
+    s3_key = s3_service.generate_s3_key(
+        user_id=str(user.id),
+        filename=f"{model.id}{ext}",
+        media_type="training-videos",
+        unique_id=str(model.id),
+    )
+
+    upload_url = await s3_service.generate_presigned_upload_url(
+        s3_key=s3_key,
+        content_type=data.content_type,
+        expiration=PRESIGNED_URL_EXPIRATION,
+    )
+
+    if not upload_url:
+        # Rollback: delete the model record
+        await db.delete(model)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate upload URL",
+        )
+
+    # Save S3 key to model
+    model.source_video_key = s3_key
+    await db.commit()
+    timings["generate_presigned_url"] = (time.perf_counter() - t0) * 1000
+
+    timings["total"] = (time.perf_counter() - total_start) * 1000
+
+    logger.info(
+        f"[PERF] init_upload: "
+        f"training_check={timings['training_limit_check']:.1f}ms, "
+        f"create_model={timings['create_model_record']:.1f}ms, "
+        f"consume_training={timings['consume_training']:.1f}ms, "
+        f"presigned_url={timings['generate_presigned_url']:.1f}ms, "
+        f"TOTAL={timings['total']:.1f}ms"
+    )
+
+    return UploadInitResponse(
+        model_id=model.id,
+        upload_url=upload_url,
+        s3_key=s3_key,
+        expires_in=PRESIGNED_URL_EXPIRATION,
+    )
+
+
+@router.post("/upload/complete", response_model=DirectUploadResponse, status_code=status.HTTP_200_OK)
+async def complete_upload(
+    data: UploadCompleteRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Complete a direct S3 upload and start processing.
+
+    This is the final step in the direct S3 upload flow:
+    1. Client has already called /upload/init and uploaded to S3
+    2. Client calls this endpoint to notify the server
+    3. Server verifies the file exists in S3, downloads it, and starts processing
+
+    The video is downloaded from S3 to local disk for processing.
+    """
+    total_start = time.perf_counter()
+    timings = {}
+
+    # Find the model record
+    t0 = time.perf_counter()
+    result = await db.execute(
+        select(VideoModel).where(
+            VideoModel.id == data.model_id,
+            VideoModel.user_id == user.id,
+        )
+    )
+    model = result.scalar_one_or_none()
+    timings["db_lookup"] = (time.perf_counter() - t0) * 1000
+
+    if not model:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Video model not found",
+        )
+
+    if model.status != ModelStatus.UPLOADING.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot complete upload for model in '{model.status}' status",
+        )
+
+    if not model.source_video_key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Model has no S3 key. Call /upload/init first.",
+        )
+
+    # Verify file exists in S3
+    t0 = time.perf_counter()
+    exists = await s3_service.file_exists(model.source_video_key)
+    timings["s3_check"] = (time.perf_counter() - t0) * 1000
+
+    if not exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Video file not found in S3. Please upload the file first.",
+        )
+
+    # Get file size from S3 if not provided or to verify
+    t0 = time.perf_counter()
+    s3_file_size = await s3_service.get_file_size(model.source_video_key)
+    timings["s3_size"] = (time.perf_counter() - t0) * 1000
+
+    # Update model with metadata
+    t0 = time.perf_counter()
+    model.file_size_bytes = s3_file_size or data.file_size_bytes
+    model.duration_seconds = data.duration_seconds
+    model.progress_percent = 5  # File uploaded, starting processing
+    await db.commit()
+    await db.refresh(model)
+    timings["db_update"] = (time.perf_counter() - t0) * 1000
+
+    timings["total"] = (time.perf_counter() - total_start) * 1000
+
+    logger.info(
+        f"[PERF] complete_upload: "
+        f"db_lookup={timings['db_lookup']:.1f}ms, "
+        f"s3_check={timings['s3_check']:.1f}ms, "
+        f"s3_size={timings['s3_size']:.1f}ms, "
+        f"db_update={timings['db_update']:.1f}ms, "
+        f"TOTAL={timings['total']:.1f}ms"
+    )
+
+    # Download from S3 and start processing in background
+    settings = LiveTalkingSettings()
+    Path(settings.VIDEO_LOCAL_PATH).mkdir(parents=True, exist_ok=True)
+    ext = os.path.splitext(model.source_video_key)[1] or ".mp4"
+    local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
+
+    background_tasks.add_task(
+        process_s3_upload_background_tasks,
+        model_id=model.id,
+        user_id=user.id,
+        s3_key=model.source_video_key,
+        local_path=local_path,
+    )
+
+    return DirectUploadResponse(
+        model=VideoModelBrief.model_validate(model),
+        job_id=None,  # Job created in background after video processing
+        message="Upload complete, processing started",
+    )
+
+
+async def process_s3_upload_background_tasks(
+    model_id: UUID,
+    user_id: int,
+    s3_key: str,
+    local_path: str,
+):
+    """
+    Background task to download video from S3 and process it.
+
+    Flow:
+    1. Download video from S3 to local disk
+    2. Process video (trim 60s, 25fps, remove audio)
+    3. Create avatar job
+    4. Generate thumbnail and trigger avatar processing
+    """
+    from app.db import get_db_session
+
+    # Step 1: Download from S3
+    try:
+        logger.info(f"Downloading video from S3: {s3_key}")
+        success = await s3_service.download_file(s3_key, local_path)
+        if not success:
+            raise Exception("S3 download failed")
+        logger.info(f"Downloaded video to: {local_path}")
+    except Exception as e:
+        logger.error(f"Failed to download video from S3 for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Failed to download video from S3: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 2: Process video (same as direct upload flow)
+    raw_path = local_path
+    processed_path = local_path.replace("_raw", "")
+
+    try:
+        _, processed_duration, _ = await video_service.process_training_video(raw_path, processed_path)
+        logger.info(f"Processed video: {processed_path} (duration: {processed_duration:.2f}s)")
+
+        # Update model with processed info
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.duration_seconds = int(processed_duration)
+                model.file_size_bytes = os.path.getsize(processed_path)
+                model.local_video_path = processed_path
+                await db.commit()
+
+        # Clean up raw file
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+    except Exception as e:
+        logger.error(f"Video processing failed for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Video processing failed: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 3: Create avatar job
+    try:
+        async with get_db_session() as db:
+            job = await avatar_job_service.create_job(
+                video_model_id=model_id,
+                user_id=user_id,
+                db=db,
+            )
+            logger.info(f"Created avatar job {job.id} for video model {model_id}")
+    except Exception as e:
+        logger.error(f"Failed to create avatar job for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Failed to create avatar job: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 4: Generate thumbnail and trigger avatar processing
+    async def generate_and_upload_thumbnail():
+        try:
+            thumbnail_path = await extract_thumbnail(processed_path, timestamp=1.0)
+            if not thumbnail_path:
+                logger.warning(f"Failed to extract thumbnail for model {model_id}")
+                return
+
+            thumbnail_s3_key = s3_service.generate_s3_key(
+                user_id=str(user_id),
+                filename=f"{model_id}.jpg",
+                media_type="thumbnails",
+                unique_id=str(model_id),
+            )
+
+            success = await s3_service.upload_file(
+                thumbnail_path, thumbnail_s3_key, content_type="image/jpeg"
+            )
+
+            if success:
+                logger.info(f"Thumbnail uploaded: {thumbnail_s3_key}")
+                async with get_db_session() as db:
+                    result = await db.execute(
+                        select(VideoModel).where(VideoModel.id == model_id)
+                    )
+                    model = result.scalar_one_or_none()
+                    if model:
+                        model.thumbnail_key = thumbnail_s3_key
+                        await db.commit()
+
+            if thumbnail_path and os.path.exists(thumbnail_path):
+                os.remove(thumbnail_path)
+
+        except Exception as e:
+            logger.error(f"Thumbnail generation error for model {model_id}: {e}")
+
+    async def trigger_avatar_processing():
+        try:
+            async with get_db_session() as db:
+                await avatar_job_service.process_pending_jobs(db)
+        except Exception as e:
+            logger.error(f"Avatar processing trigger error for model {model_id}: {e}")
+
+    results = await asyncio.gather(
+        generate_and_upload_thumbnail(),
+        trigger_avatar_processing(),
+        return_exceptions=True,
+    )
+
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            task_name = ["generate_thumbnail", "trigger_avatar_processing"][i]
+            logger.error(f"Background task '{task_name}' failed for model {model_id}: {result}")
 
 
 async def process_upload_background_tasks(

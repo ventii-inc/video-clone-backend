@@ -69,3 +69,24 @@ class DirectUploadResponse(BaseModel):
     model: VideoModelBrief
     job_id: UUID | None = None  # Job created in background after video processing
     message: str
+
+
+class UploadInitRequest(BaseModel):
+    """Request to initialize a direct S3 upload"""
+    name: str = Field(..., min_length=1, max_length=100, description="Model name")
+    content_type: str = Field(default="video/mp4", description="MIME type of the video file")
+
+
+class UploadInitResponse(BaseModel):
+    """Response with presigned URL for direct S3 upload"""
+    model_id: UUID
+    upload_url: str
+    s3_key: str
+    expires_in: int = 300  # seconds
+
+
+class UploadCompleteRequest(BaseModel):
+    """Request to complete a direct S3 upload"""
+    model_id: UUID
+    duration_seconds: int = Field(..., gt=0, description="Video duration in seconds")
+    file_size_bytes: int = Field(..., gt=0, description="File size in bytes")

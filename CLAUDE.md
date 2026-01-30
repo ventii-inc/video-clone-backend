@@ -43,6 +43,7 @@ Required environment variables:
 Optional environment variables:
 - `SENTRY_DSN` - Sentry error tracking (disabled in debug mode)
 - `CORS_ORIGINS` - Comma-separated list of additional CORS origins
+- `UPLOAD_MODE` - Video upload mode: `direct_s3` (default) or `server`. Direct S3 bypasses slow RunPod network.
 - `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STANDARD`, `STRIPE_PRICE_MINUTES` - Stripe billing
 - `FISH_AUDIO_API_KEY` - Fish Audio voice cloning and TTS
 - `LIVETALKING_ROOT`, `LIVETALKING_VENV`, `LIVETALKING_MODE` - LiveTalking avatar generation (cli/api/auto)
@@ -187,6 +188,36 @@ jobs_started = await avatar_job_service.process_pending_jobs(db)
 # Retry a failed job
 job = await avatar_job_service.retry_job(job_id, db)
 ```
+
+**Direct S3 Upload (for slow network environments like RunPod):**
+
+When `UPLOAD_MODE=direct_s3` (default), clients upload directly to S3 to bypass slow server network:
+
+```
+# Step 1: Get presigned upload URL
+POST /api/v1/models/video/upload/init
+{
+  "name": "My Avatar",
+  "content_type": "video/mp4"
+}
+# Returns: { "model_id": "...", "upload_url": "https://s3...", "s3_key": "...", "expires_in": 300 }
+
+# Step 2: Client uploads directly to S3 using the presigned URL
+PUT {upload_url}
+Content-Type: video/mp4
+<binary video data>
+
+# Step 3: Notify server to start processing
+POST /api/v1/models/video/upload/complete
+{
+  "model_id": "...",
+  "duration_seconds": 30,
+  "file_size_bytes": 3500000
+}
+# Returns: { "model": {...}, "message": "Upload complete, processing started" }
+```
+
+When `UPLOAD_MODE=server`, clients use the legacy `/upload` endpoint that uploads through the server.
 
 **Firebase Setup:**
 1. Download service account JSON from Firebase Console
