@@ -14,6 +14,7 @@ from app.models.subscription import PlanType, SubscriptionStatus
 from app.models.payment_history import PaymentType, PaymentStatus
 from app.services.stripe.stripe_config import stripe_settings
 from app.services.usage_service import usage_service
+from app.utils.constants import PLAN_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -468,7 +469,20 @@ class StripeService:
         )
 
         await db.commit()
-        logger.info(f"Activated subscription for user {user_id}")
+
+        # Update usage record with new plan's base minutes
+        # This ensures users get their credits immediately after subscribing
+        usage_record = await usage_service.get_or_create_current_usage(
+            user_id, db, subscription=subscription
+        )
+        plan_config = PLAN_CONFIG.get(PlanType.STANDARD.value, {})
+        usage_record.base_minutes = plan_config.get("minutes", 0)
+        await db.commit()
+
+        logger.info(
+            f"Activated subscription for user {user_id}, "
+            f"base_minutes set to {usage_record.base_minutes}"
+        )
 
     async def _handle_minutes_checkout(
         self,

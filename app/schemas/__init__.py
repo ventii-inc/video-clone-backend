@@ -51,6 +51,15 @@ from app.schemas.avatar_job import (
     JobQueueStatusResponse,
     RetryJobResponse,
 )
+from app.schemas.worker import (
+    AvatarJobRequest,
+    VideoJobRequest,
+    WorkerHealthResponse,
+    WorkerCapacityResponse,
+    JobSubmitResponse,
+    JobProgressCallback,
+    JobCompletionCallback,
+)
 
 __all__ = [
     # Common
@@ -98,4 +107,12 @@ __all__ = [
     "AvatarJobResponse",
     "JobQueueStatusResponse",
     "RetryJobResponse",
+    # Worker
+    "AvatarJobRequest",
+    "VideoJobRequest",
+    "WorkerHealthResponse",
+    "WorkerCapacityResponse",
+    "JobSubmitResponse",
+    "JobProgressCallback",
+    "JobCompletionCallback",
 ]

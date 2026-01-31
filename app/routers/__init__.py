@@ -11,6 +11,7 @@ from app.routers.billing import router as billing_router
 from app.routers.settings import router as settings_router
 from app.routers.avatar import router as avatar_router
 from app.routers.avatar_backend import router as avatar_backend_router
+from app.routers.worker import router as worker_router
 
 __all__ = [
     "auth_router",
@@ -24,4 +25,5 @@ __all__ = [
     "settings_router",
     "avatar_router",
     "avatar_backend_router",
+    "worker_router",
 ]

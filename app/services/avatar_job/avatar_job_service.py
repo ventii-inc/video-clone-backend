@@ -18,11 +18,13 @@ from app.models import AvatarJob, User, VideoModel
 from app.models.avatar_job import JobStatus
 from app.models.video_model import ModelStatus, ProcessingStage
 from app.services.avatar_job.runpod_client import runpod_client
+from app.services.lipsync_client import lipsync_client
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.email import TrainingCompletionData, TrainingFailureData, get_email_service
 from app.services.progress import update_video_model_progress
 from app.services.s3 import s3_service
+from app.services.worker.worker_client import worker_client
 from app.utils import logger
 
 # Directory for job output files
@@ -177,17 +179,39 @@ class AvatarJobService:
 
     async def _get_execution_mode(self) -> str:
         """
-        Determine execution mode based on GPU availability.
+        Determine execution mode based on configuration and availability.
 
         Logic:
-        1. If LIVETALKING_MODE is explicitly "cli" → return "cli"
-        2. If LIVETALKING_MODE is "auto" or "api" → check RunPod GPU availability
-        3. If GPU available → return "api"
-        4. Otherwise → return "cli" (fallback)
+        1. If WORKER_SERVICE_URL configured → return "worker" (highest priority)
+        2. If LIPSYNC_ENABLED=true → return "remote"
+        3. If LIVETALKING_MODE is explicitly "cli" → return "cli"
+        4. If LIVETALKING_MODE is "auto" or "api" → check RunPod GPU availability
+        5. If GPU available → return "api"
+        6. Otherwise → return "cli" (fallback)
 
         Returns:
-            "cli" or "api"
+            "cli", "api", "remote", or "worker"
         """
+        # Check if worker service is configured (highest priority)
+        if worker_client.is_enabled:
+            # Verify worker is reachable and has capacity
+            is_healthy = await worker_client.health_check()
+            if is_healthy:
+                logger.info("Worker service enabled and healthy, using worker mode")
+                return "worker"
+            else:
+                logger.warning("Worker service configured but unhealthy, falling back")
+
+        # Check if remote LipSync service is enabled
+        if lipsync_client.is_enabled:
+            # Verify service is reachable
+            is_healthy = await lipsync_client.health_check()
+            if is_healthy:
+                logger.info("Remote LipSync service enabled and healthy, using remote mode")
+                return "remote"
+            else:
+                logger.warning("Remote LipSync service configured but unhealthy, falling back")
+
         settings = LiveTalkingSettings()
 
         # If explicitly set to CLI, use CLI
@@ -247,11 +271,15 @@ class AvatarJobService:
 
         await db.commit()
 
-        # Choose execution mode based on GPU availability
+        # Choose execution mode based on configuration and availability
         mode = await self._get_execution_mode()
 
         if mode == "cli":
             return await self._trigger_job_cli(job, video_model, db)
+        elif mode == "remote":
+            return await self._trigger_job_remote(job, video_model, db)
+        elif mode == "worker":
+            return await self._trigger_job_worker(job, video_model, db)
         else:
             return await self._trigger_job_api(job, video_model, db)
 
@@ -423,6 +451,156 @@ class AvatarJobService:
                 await db.commit()
                 logger.warning(
                     f"Job {job.id} failed, will retry. "
+                    f"Attempts: {job.attempts}/{job.max_attempts}"
+                )
+                return False
+            else:
+                await self.mark_failed(
+                    job.id,
+                    f"Max attempts reached. Last error: {response.error}",
+                    db,
+                )
+                return False
+
+    async def _trigger_job_remote(
+        self, job: AvatarJob, video_model: VideoModel, db: AsyncSession
+    ) -> bool:
+        """
+        Trigger avatar generation via remote Lip-Sync-Experiment service.
+
+        This submits the job to a separately hosted LipSync service which
+        will process the avatar and call back when complete.
+        """
+        # Generate presigned URL for the video (2 hours expiry)
+        video_url = await s3_service.generate_presigned_url(
+            video_model.source_video_key, expiration=7200
+        )
+
+        if not video_url:
+            logger.error(f"Could not generate presigned URL for job {job.id}")
+            await self.mark_failed(job.id, "Could not generate download URL", db)
+            return False
+
+        # Build callback URL
+        backend_url = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
+        if not backend_url:
+            logger.error("BACKEND_PUBLIC_URL not configured for remote mode")
+            await self.mark_failed(job.id, "Backend callback URL not configured", db)
+            return False
+
+        callback_url = f"{backend_url}/api/v1/internal/avatar/jobs/{job.id}/callback"
+
+        # Submit job to remote LipSync service
+        from app.services.lipsync_client.lipsync_client import LipSyncJobOptions
+
+        options = LipSyncJobOptions(
+            max_frames=1800,
+            img_size=256,
+            model="wav2lip",
+        )
+
+        response = await lipsync_client.submit_job(
+            job_id=job.id,
+            video_model_id=job.video_model_id,
+            user_id=job.user_id,
+            video_url=video_url,
+            callback_url=callback_url,
+            options=options,
+        )
+
+        if response.success:
+            # Job submitted successfully - will receive callback when done
+            logger.info(
+                f"Job {job.id} submitted to remote LipSync service, "
+                f"awaiting callback at {callback_url}"
+            )
+
+            # Store execution mode
+            video_model.execution_mode = "remote"
+            await db.commit()
+
+            return True
+        else:
+            # Submission failed
+            if job.attempts < job.max_attempts:
+                job.status = JobStatus.PENDING.value
+                job.error_message = f"Attempt {job.attempts} failed: {response.error}"
+                await db.commit()
+                logger.warning(
+                    f"Job {job.id} submission failed, will retry. "
+                    f"Attempts: {job.attempts}/{job.max_attempts}"
+                )
+                return False
+            else:
+                await self.mark_failed(
+                    job.id,
+                    f"Max attempts reached. Last error: {response.error}",
+                    db,
+                )
+                return False
+
+    async def _trigger_job_worker(
+        self, job: AvatarJob, video_model: VideoModel, db: AsyncSession
+    ) -> bool:
+        """
+        Trigger avatar generation via remote worker service.
+
+        This submits the job to a separately hosted worker (e.g., RunPod)
+        which will process the avatar and call back when complete.
+        """
+        # Generate presigned URL for the video (2 hours expiry)
+        video_url = await s3_service.generate_presigned_url(
+            video_model.source_video_key, expiration=7200
+        )
+
+        if not video_url:
+            logger.error(f"Could not generate presigned URL for job {job.id}")
+            await self.mark_failed(job.id, "Could not generate download URL", db)
+            return False
+
+        # Build callback URL
+        backend_url = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
+        if not backend_url:
+            logger.error("BACKEND_PUBLIC_URL not configured for worker mode")
+            await self.mark_failed(job.id, "Backend callback URL not configured", db)
+            return False
+
+        callback_url = f"{backend_url}/api/v1/internal/avatar/jobs/{job.id}/callback"
+
+        # Submit job to worker service
+        response = await worker_client.submit_avatar_job(
+            job_id=job.id,
+            video_model_id=job.video_model_id,
+            user_id=job.user_id,
+            video_url=video_url,
+            callback_url=callback_url,
+            options={
+                "max_frames": 1800,
+                "img_size": 256,
+                "model": "wav2lip",
+            },
+        )
+
+        if response.success:
+            # Job submitted successfully - will receive callback when done
+            logger.info(
+                f"Job {job.id} submitted to worker service, "
+                f"awaiting callback at {callback_url}"
+            )
+
+            # Store execution mode
+            video_model.execution_mode = "worker"
+            await db.commit()
+
+            return True
+        else:
+            # Submission failed
+            if job.attempts < job.max_attempts:
+                job.status = JobStatus.PENDING.value
+                job.error_message = f"Attempt {job.attempts} failed: {response.error}"
+                await db.commit()
+                logger.warning(
+                    f"Job {job.id} worker submission failed, will retry. "
                     f"Attempts: {job.attempts}/{job.max_attempts}"
                 )
                 return False

@@ -8,16 +8,23 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models import VideoModel, AvatarJob
-from app.models.video_model import ModelStatus
+from app.models import VideoModel, AvatarJob, User
+from app.models.video_model import ModelStatus, ProcessingStage
+from app.models.avatar_job import JobStatus
 from app.services.api_key import get_api_key
 from app.services.avatar_job import avatar_job_service
+from app.services.email import TrainingCompletionData, TrainingFailureData, get_email_service
 from app.services.s3 import s3_service
+from app.services.progress import update_video_model_progress
 from app.schemas.avatar_backend import (
     PendingVideoItem,
     PendingVideosResponse,
     AvatarCompleteRequest,
     AvatarCompleteResponse,
+    JobCallbackRequest,
+    JobCallbackResponse,
+    JobProgressRequest,
+    JobProgressResponse,
 )
 from app.schemas.avatar_job import (
     JobQueueStatusResponse,
@@ -217,3 +224,174 @@ async def get_job_details(
         )
 
     return AvatarJobResponse.model_validate(job)
+
+
+@router.post("/jobs/{job_id}/callback", response_model=JobCallbackResponse)
+async def job_callback(
+    job_id: UUID,
+    request: JobCallbackRequest,
+    _api_key: str = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
+) -> JobCallbackResponse:
+    """
+    Receive completion callback from remote LipSync service.
+
+    Called by the Lip-Sync-Experiment service when job processing completes
+    (either successfully or with an error).
+
+    Requires X-API-Key header for authentication.
+    """
+    # Find the job
+    result = await db.execute(select(AvatarJob).where(AvatarJob.id == job_id))
+    job = result.scalar_one_or_none()
+
+    if not job:
+        logger.warning(f"Callback received for unknown job: {job_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found",
+        )
+
+    # Find the associated video model
+    video_result = await db.execute(
+        select(VideoModel).where(VideoModel.id == job.video_model_id)
+    )
+    video_model = video_result.scalar_one_or_none()
+
+    if not video_model:
+        logger.error(f"Video model not found for job {job_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Video model for job {job_id} not found",
+        )
+
+    # Fetch user for email notification
+    user_result = await db.execute(select(User).where(User.id == job.user_id))
+    user = user_result.scalar_one_or_none()
+
+    # Update based on callback status
+    if request.status == "completed" and request.s3_key:
+        # Success - update job and video model
+        job.status = JobStatus.COMPLETED.value
+        job.completed_at = datetime.utcnow()
+        job.avatar_s3_key = request.s3_key
+        job.error_message = None
+
+        video_model.status = ModelStatus.COMPLETED.value
+        video_model.model_data_key = request.s3_key
+        video_model.processing_stage = ProcessingStage.COMPLETED.value
+        video_model.progress_percent = 100
+        video_model.processing_completed_at = datetime.utcnow()
+        video_model.error_message = None
+
+        logger.info(
+            f"Job {job_id} completed successfully, s3_key={request.s3_key}, "
+            f"frames={request.frame_count}, time={request.processing_time_seconds}s"
+        )
+        message = "Job marked as completed"
+
+        # Send completion email
+        if user and user.email:
+            try:
+                email_service = get_email_service()
+                await email_service.send_training_completion_email(
+                    to_email=user.email,
+                    data=TrainingCompletionData(
+                        user_name=user.name or "there",
+                        model_name=video_model.name if video_model else "Your Avatar",
+                        model_type="video",
+                        dashboard_url=None,
+                    ),
+                )
+                logger.info(f"Sent completion email to {user.email} for job {job_id}")
+            except Exception as e:
+                logger.error(f"Failed to send completion email for job {job_id}: {e}")
+
+    else:
+        # Failure - update with error info
+        error_message = request.error_message or "Unknown error"
+        job.status = JobStatus.FAILED.value
+        job.completed_at = datetime.utcnow()
+        job.error_message = error_message
+
+        video_model.status = ModelStatus.FAILED.value
+        video_model.processing_stage = ProcessingStage.FAILED.value
+        video_model.error_message = error_message
+        video_model.processing_completed_at = datetime.utcnow()
+
+        logger.error(
+            f"Job {job_id} failed: {request.error_message} (code: {request.error_code})"
+        )
+        message = "Job marked as failed"
+
+        # Send failure email
+        if user and user.email:
+            try:
+                email_service = get_email_service()
+                await email_service.send_training_failure_email(
+                    to_email=user.email,
+                    data=TrainingFailureData(
+                        user_name=user.name or "there",
+                        model_name=video_model.name if video_model else "Your Avatar",
+                        model_type="video",
+                        error_message=error_message,
+                        dashboard_url=None,
+                    ),
+                )
+                logger.info(f"Sent failure email to {user.email} for job {job_id}")
+            except Exception as e:
+                logger.error(f"Failed to send failure email for job {job_id}: {e}")
+
+    await db.commit()
+
+    return JobCallbackResponse(success=True, message=message)
+
+
+@router.post("/jobs/{job_id}/progress", response_model=JobProgressResponse)
+async def job_progress(
+    job_id: UUID,
+    request: JobProgressRequest,
+    _api_key: str = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
+) -> JobProgressResponse:
+    """
+    Receive progress update from remote LipSync service.
+
+    Called by the Lip-Sync-Experiment service to update job progress
+    during processing.
+
+    Requires X-API-Key header for authentication.
+    """
+    # Find the job
+    result = await db.execute(select(AvatarJob).where(AvatarJob.id == job_id))
+    job = result.scalar_one_or_none()
+
+    if not job:
+        logger.warning(f"Progress update received for unknown job: {job_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found",
+        )
+
+    # Map stage string to ProcessingStage enum
+    try:
+        stage = ProcessingStage(request.stage.lower())
+    except ValueError:
+        logger.warning(f"Unknown processing stage: {request.stage}")
+        # Default to training if unknown
+        stage = ProcessingStage.TRAINING
+
+    # Update the video model progress
+    await update_video_model_progress(
+        db=db,
+        model_id=job.video_model_id,
+        stage=stage,
+        progress_percent=request.progress_percent,
+    )
+
+    logger.debug(
+        f"Job {job_id} progress update: stage={stage.value}, "
+        f"progress={request.progress_percent}%, message={request.message}"
+    )
+
+    return JobProgressResponse(success=True)

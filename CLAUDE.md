@@ -50,6 +50,18 @@ Optional environment variables:
 - `AVATAR_API_KEY` - API key for backend-to-backend avatar endpoints
 - `AVATAR_MAX_CONCURRENT` - Max concurrent avatar generation jobs (default: 3)
 - `AVATAR_JOB_CHECK_INTERVAL` - Interval in seconds for background job status checks (default: 10)
+- `LIPSYNC_ENABLED` - Enable remote LipSync service mode (true/false)
+- `LIPSYNC_SERVICE_URL` - URL of the remote Lip-Sync-Experiment service
+- `LIPSYNC_API_KEY` - API key for authenticating with LipSync service
+- `LIPSYNC_TIMEOUT` - Request timeout in seconds (default: 30)
+- `BACKEND_PUBLIC_URL` - Public URL of this backend for callbacks (required for remote/worker mode)
+
+**Dual-Mode Backend (API ↔ Worker):**
+- `BACKEND_MODE` - Deployment mode: `api` (default, full app) or `worker` (minimal, CLI-focused)
+- `WORKER_SERVICE_URL` - URL of the worker service (API mode, for submitting jobs)
+- `WORKER_API_KEY` - Shared secret for API ↔ Worker authentication
+- `API_SERVER_URL` - URL of the API server (Worker mode, for callbacks)
+- `API_SERVER_API_KEY` - API key for worker → API callbacks
 
 ## Architecture
 
@@ -62,7 +74,7 @@ Optional environment variables:
 - Backend-to-backend auth: API key in `X-API-Key` header (see `app/services/api_key/`)
 
 **Key Modules:**
-- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings, avatar, avatar_backend)
+- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings, avatar, avatar_backend, worker)
 - `app/models/` - SQLAlchemy models (User, UserProfile, VideoModel, VoiceModel, GeneratedVideo, Subscription, AvatarJob, etc.)
 - `app/schemas/` - Pydantic request/response schemas
 - `app/services/` - Business logic services (see Service Layer below)
@@ -75,6 +87,8 @@ Optional environment variables:
 - `stripe/` - Stripe payments, subscriptions, webhooks
 - `fish_audio/` - Voice cloning and TTS via Fish Audio API
 - `livetalking/` - Avatar generation via CLI subprocess or RunPod API
+- `lipsync_client/` - Client for remote Lip-Sync-Experiment service
+- `worker/` - Dual-mode worker client/service (API ↔ Worker communication)
 - `avatar_job/` - Avatar generation job queue with concurrency control
 - `scheduler/` - Background task scheduler for periodic job status checks
 - `video/` - Video generation orchestration
@@ -85,7 +99,11 @@ Optional environment variables:
 **Avatar Generation Pipeline:**
 1. User uploads video → `VideoModel` created with `status=PENDING`
 2. `AvatarJob` queued → job processor checks concurrent slots
-3. Execution mode chosen (CLI local or RunPod API based on GPU availability)
+3. Execution mode chosen (priority order):
+   - `worker` - If `WORKER_SERVICE_URL` configured, jobs sent to remote worker (RunPod)
+   - `remote` - If `LIPSYNC_ENABLED=true`, jobs sent to external Lip-Sync-Experiment service
+   - `cli` - Local subprocess execution (default)
+   - `api` - RunPod API (if GPU available)
 4. Progress tracked via `ProcessingStage` enum (PENDING → PREPARING → TRAINING → FINALIZING → COMPLETED)
 5. Result uploaded to S3 as `.tar` archive → email notification sent
 
@@ -239,3 +257,90 @@ aws rds describe-db-clusters --region ap-northeast-1 --db-cluster-identifier vid
 ```
 
 Note: Aurora automatically restarts stopped clusters after 7 days.
+
+## Dual-Mode Backend (API ↔ Worker)
+
+The backend supports two deployment modes via `BACKEND_MODE`:
+
+**API Mode (EC2):** `BACKEND_MODE=api` (default)
+- Full application with all user-facing endpoints
+- Firebase authentication, Stripe billing, dashboard
+- Job orchestration: creates jobs and submits to worker
+- Receives callbacks from worker with progress/completion
+
+**Worker Mode (RunPod):** `BACKEND_MODE=worker`
+- Minimal application with only worker endpoints
+- No Firebase, no user auth (uses API key auth)
+- Executes avatar/video generation via CLI (genavatar.py, benchmark_e2e.py)
+- Downloads videos from S3, uploads results, sends callbacks to API
+
+**Architecture:**
+```
+EC2 (BACKEND_MODE=api)              RunPod (BACKEND_MODE=worker)
+┌─────────────────────┐             ┌─────────────────────┐
+│ User Auth, Billing  │             │ CLI Execution       │
+│ Dashboard, Generate │ ──jobs───▶  │ genavatar.py        │
+│                     │             │ benchmark_e2e.py    │
+│ Callback Endpoints  │ ◀─progress─ │                     │
+│ Job Orchestration   │ ◀─complete─ │ S3 Upload/Download  │
+└─────────────────────┘             └─────────────────────┘
+```
+
+**Worker Endpoints:**
+```
+POST /api/v1/worker/jobs/avatar   # Execute avatar generation
+POST /api/v1/worker/jobs/video    # Execute video generation
+GET  /api/v1/worker/health        # Health + GPU info
+GET  /api/v1/worker/capacity      # Available processing slots
+```
+
+**Running Locally:**
+```bash
+# Terminal 1: Worker
+BACKEND_MODE=worker WORKER_API_KEY=test-key API_SERVER_URL=http://localhost:8000 API_SERVER_API_KEY=test-key \
+  uv run uvicorn main:app --port 8001
+
+# Terminal 2: API
+BACKEND_MODE=api WORKER_SERVICE_URL=http://localhost:8001 WORKER_API_KEY=test-key AVATAR_API_KEY=test-key \
+  uv run uvicorn main:app --port 8000
+```
+
+**Worker Client Usage (API server submitting jobs):**
+```python
+from app.services.worker import worker_client
+
+# Submit avatar job to worker
+response = await worker_client.submit_avatar_job(
+    job_id=job.id,
+    video_model_id=video_model.id,
+    user_id=user.id,
+    video_url=presigned_url,
+    callback_url=f"{backend_url}/api/v1/internal/avatar/jobs/{job.id}/callback",
+)
+
+# Check worker capacity
+capacity = await worker_client.check_capacity()
+print(f"Available slots: {capacity.available_slots}")
+```
+
+**API Callback Client Usage (Worker sending callbacks):**
+```python
+from app.services.worker import api_callback_client
+
+# Send progress update
+await api_callback_client.send_progress(
+    job_id=job_id,
+    stage="training",
+    progress_percent=50,
+    message="Processing frames",
+)
+
+# Send completion
+await api_callback_client.send_completion(
+    job_id=job_id,
+    status="completed",
+    s3_key="avatars/123/avatar-id.tar",
+    frame_count=1800,
+    processing_time_seconds=120.5,
+)
+```

@@ -23,6 +23,24 @@ def _get_avatar_api_key() -> str:
     return api_key
 
 
+def _get_worker_api_key() -> str:
+    """Get the worker API key from environment variables.
+
+    Falls back to AVATAR_API_KEY for backwards compatibility.
+    """
+    api_key = os.getenv("WORKER_API_KEY")
+    if not api_key:
+        # Fallback to AVATAR_API_KEY for backwards compatibility
+        api_key = os.getenv("AVATAR_API_KEY")
+    if not api_key:
+        logger.error("WORKER_API_KEY and AVATAR_API_KEY environment variables are not set")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error",
+        )
+    return api_key
+
+
 def verify_api_key(api_key: str) -> bool:
     """
     Verify that the provided API key matches the expected value.
@@ -68,6 +86,63 @@ async def get_api_key(request: Request) -> str:
 
     if not verify_api_key(api_key):
         logger.warning(f"Invalid API key in request to {request.url.path}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    return api_key
+
+
+def verify_worker_api_key(api_key: str) -> bool:
+    """
+    Verify that the provided API key matches the worker API key.
+
+    Args:
+        api_key: The API key to verify
+
+    Returns:
+        True if the API key is valid, False otherwise
+    """
+    expected_key = _get_worker_api_key()
+    return api_key == expected_key
+
+
+async def get_worker_api_key(request: Request) -> str:
+    """
+    FastAPI dependency to extract and validate the worker API key from request headers.
+
+    Used for worker endpoints to validate requests from API server.
+    Falls back to AVATAR_API_KEY if WORKER_API_KEY is not set.
+
+    Usage:
+        @router.get("/worker/endpoint")
+        async def worker_route(api_key: str = Depends(get_worker_api_key)):
+            # Route is protected by worker API key
+            pass
+
+    Args:
+        request: The FastAPI request object
+
+    Returns:
+        The validated API key string
+
+    Raises:
+        HTTPException: 401 if API key is missing or invalid
+    """
+    api_key = request.headers.get(API_KEY_HEADER_NAME)
+
+    if not api_key:
+        logger.warning(f"Missing worker API key in request to {request.url.path}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    if not verify_worker_api_key(api_key):
+        logger.warning(f"Invalid worker API key in request to {request.url.path}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
