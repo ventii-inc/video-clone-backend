@@ -86,3 +86,21 @@ class JobProgressResponse(BaseModel):
     """Response to progress update"""
 
     success: bool = Field(..., description="Whether update was processed successfully")
+
+
+class VideoCallbackRequest(BaseModel):
+    """Request from worker service when video generation completes"""
+
+    status: str = Field(..., description="Job status: 'completed' or 'failed'")
+    s3_key: Optional[str] = Field(
+        default=None, description="S3 key where generated video was uploaded (on success)"
+    )
+    duration: Optional[float] = Field(
+        default=None, description="Video duration in seconds"
+    )
+    processing_time_seconds: Optional[float] = Field(
+        default=None, description="Total processing time in seconds"
+    )
+    error_message: Optional[str] = Field(
+        default=None, description="Error message if job failed"
+    )

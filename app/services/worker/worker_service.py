@@ -297,6 +297,14 @@ class WorkerService:
                 f"duration={result.duration}s, s3_key={result.s3_key}"
             )
 
+            # Send completion callback to API server
+            await api_callback_client.send_video_completion(
+                video_id=video_id,
+                s3_key=result.s3_key,
+                duration=result.duration or 0,
+                processing_time_seconds=processing_time,
+            )
+
             return {
                 "success": True,
                 "video_id": str(video_id),
@@ -308,6 +316,12 @@ class WorkerService:
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Video job {video_id} failed: {error_msg}", exc_info=True)
+
+            # Send failure callback to API server
+            await api_callback_client.send_video_failure(
+                video_id=video_id,
+                error_message=error_msg,
+            )
 
             return {
                 "success": False,

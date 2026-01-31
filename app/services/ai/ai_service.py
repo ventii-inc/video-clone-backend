@@ -115,7 +115,11 @@ class AIService:
             await db.commit()
 
     def _get_mode(self) -> str:
-        """Get execution mode from settings."""
+        """Get execution mode - worker takes priority over CLI."""
+        from app.services.worker import worker_client
+
+        if worker_client.is_enabled:
+            return "worker"
         settings = LiveTalkingSettings()
         return settings.LIVETALKING_MODE
 
@@ -491,8 +495,11 @@ class AIService:
         await db.commit()
 
         mode = self._get_mode()
+        logger.info(f"Video generation mode: {mode}")
 
-        if mode == "cli":
+        if mode == "worker":
+            await self._generate_video_worker(video, db)
+        elif mode == "cli":
             await self._generate_video_cli(video, db)
         else:
             await self._generate_video_mock(video, db)
@@ -702,6 +709,34 @@ class AIService:
         await self._send_video_completion_email(video, db)
 
         logger.info(f"Mock video generation completed: {video.id}")
+
+    async def _generate_video_worker(
+        self,
+        video: GeneratedVideo,
+        db: AsyncSession,
+    ) -> None:
+        """Generate video via worker service."""
+        from app.services.worker import worker_client
+
+        backend_url = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
+        if not backend_url:
+            raise ValueError("BACKEND_PUBLIC_URL not configured")
+
+        callback_url = f"{backend_url}/api/v1/internal/videos/{video.id}/callback"
+
+        response = await worker_client.submit_video_job(
+            video_id=video.id,
+            avatar_id=video.video_model_id,
+            text=video.input_text,
+            user_id=video.user_id,
+            voice_model_id=video.voice_model_id,
+            callback_url=callback_url,
+        )
+
+        if not response.success:
+            raise ValueError(f"Failed to submit to worker: {response.error}")
+
+        logger.info(f"Video job {video.id} submitted to worker")
 
     async def fail_video_model(
         self,

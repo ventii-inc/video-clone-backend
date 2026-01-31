@@ -8,12 +8,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models import VideoModel, AvatarJob, User
+from app.models import VideoModel, AvatarJob, User, GeneratedVideo
 from app.models.video_model import ModelStatus, ProcessingStage
 from app.models.avatar_job import JobStatus
+from app.models.generated_video import GenerationStatus, VideoGenerationStage
 from app.services.api_key import get_api_key
 from app.services.avatar_job import avatar_job_service
-from app.services.email import TrainingCompletionData, TrainingFailureData, get_email_service
+from app.services.email import TrainingCompletionData, TrainingFailureData, VideoGenerationCompletionData, get_email_service
+from app.services.usage_service import usage_service
 from app.services.s3 import s3_service
 from app.services.progress import update_video_model_progress
 from app.schemas.avatar_backend import (
@@ -25,6 +27,7 @@ from app.schemas.avatar_backend import (
     JobCallbackResponse,
     JobProgressRequest,
     JobProgressResponse,
+    VideoCallbackRequest,
 )
 from app.schemas.avatar_job import (
     JobQueueStatusResponse,
@@ -34,6 +37,7 @@ from app.schemas.avatar_job import (
 from app.utils import logger
 
 router = APIRouter(prefix="/internal/avatar", tags=["Internal Avatar Backend"])
+video_router = APIRouter(prefix="/internal/videos", tags=["Internal Video Backend"])
 
 
 @router.get("/pending-videos", response_model=PendingVideosResponse)
@@ -395,3 +399,115 @@ async def job_progress(
     )
 
     return JobProgressResponse(success=True)
+
+
+def _calculate_minutes_from_duration(duration_seconds: int | None) -> int:
+    """Calculate billable minutes from video duration in seconds.
+
+    Rounds up to nearest minute, minimum 1 minute.
+    """
+    if not duration_seconds or duration_seconds <= 0:
+        return 1  # Minimum 1 minute charge
+    # Round up to nearest minute
+    return max(1, (duration_seconds + 59) // 60)
+
+
+@video_router.post("/{video_id}/callback", response_model=JobCallbackResponse)
+async def video_callback(
+    video_id: UUID,
+    request: VideoCallbackRequest,
+    _api_key: str = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
+) -> JobCallbackResponse:
+    """
+    Receive video generation callback from worker.
+
+    Called by the worker service when video generation completes
+    (either successfully or with an error).
+
+    Requires X-API-Key header for authentication.
+    """
+    # Find the video
+    result = await db.execute(
+        select(GeneratedVideo).where(GeneratedVideo.id == video_id)
+    )
+    video = result.scalar_one_or_none()
+
+    if not video:
+        logger.warning(f"Video callback received for unknown video: {video_id}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Video {video_id} not found",
+        )
+
+    # Fetch user for email notification
+    user_result = await db.execute(select(User).where(User.id == video.user_id))
+    user = user_result.scalar_one_or_none()
+
+    # Update based on callback status
+    if request.status == "completed" and request.s3_key:
+        # Success - update video record
+        video.status = GenerationStatus.COMPLETED.value
+        video.processing_stage = VideoGenerationStage.COMPLETED.value
+        video.progress_percent = 100
+        video.output_video_key = request.s3_key
+        video.processing_completed_at = datetime.utcnow()
+        video.error_message = None
+
+        if request.duration:
+            video.duration_seconds = int(request.duration)
+
+        logger.info(
+            f"Video {video_id} completed successfully, s3_key={request.s3_key}, "
+            f"duration={request.duration}s, time={request.processing_time_seconds}s"
+        )
+        message = "Video marked as completed"
+
+        await db.commit()
+
+        # Deduct credits based on actual video duration
+        minutes_used = _calculate_minutes_from_duration(video.duration_seconds)
+        try:
+            await usage_service.deduct_credits(video.user_id, minutes_used, db)
+            video.credits_used = minutes_used
+            await db.commit()
+            logger.info(
+                f"Deducted {minutes_used} minutes for video {video_id} "
+                f"(duration: {video.duration_seconds}s)"
+            )
+        except ValueError as e:
+            logger.warning(f"Credit deduction issue for video {video_id}: {e}")
+            video.credits_used = minutes_used
+            await db.commit()
+
+        # Send completion email
+        if user and user.email:
+            try:
+                email_service = get_email_service()
+                await email_service.send_video_generation_completion_email(
+                    to_email=user.email,
+                    data=VideoGenerationCompletionData(
+                        user_name=user.name or user.email.split("@")[0],
+                        video_title=video.title or "Untitled Video",
+                        duration_seconds=video.duration_seconds,
+                        dashboard_url="https://ventii.jp/dashboard/videos",
+                    ),
+                )
+                logger.info(f"Sent video completion email to {user.email} for video {video_id}")
+            except Exception as e:
+                logger.error(f"Failed to send video completion email for video {video_id}: {e}")
+
+    else:
+        # Failure - update with error info
+        error_message = request.error_message or "Unknown error"
+        video.status = GenerationStatus.FAILED.value
+        video.processing_stage = VideoGenerationStage.FAILED.value
+        video.error_message = error_message
+        video.processing_completed_at = datetime.utcnow()
+
+        logger.error(f"Video {video_id} failed: {request.error_message}")
+        message = "Video marked as failed"
+
+        await db.commit()
+
+    return JobCallbackResponse(success=True, message=message)

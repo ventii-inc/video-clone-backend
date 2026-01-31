@@ -41,6 +41,7 @@ if BACKEND_MODE == "api":
         settings_router,
         avatar_router,
         avatar_backend_router,
+        video_backend_router,
     )
     from app.services.scheduler import scheduler_service
     from app.services.firebase import initialize_firebase, is_firebase_initialized
@@ -137,6 +138,7 @@ if BACKEND_MODE == "api":
     app.include_router(settings_router, prefix=API_PREFIX)
     app.include_router(avatar_router, prefix=API_PREFIX)
     app.include_router(avatar_backend_router, prefix=API_PREFIX)
+    app.include_router(video_backend_router, prefix=API_PREFIX)
 elif BACKEND_MODE == "worker":
     # Worker mode - only worker endpoints
     app.include_router(worker_router, prefix=API_PREFIX)
