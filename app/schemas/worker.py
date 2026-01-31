@@ -30,6 +30,9 @@ class VideoJobRequest(BaseModel):
     voice_model_id: Optional[UUID] = Field(
         default=None, description="Voice model for TTS"
     )
+    voice_reference_id: Optional[str] = Field(
+        default=None, description="Fish Audio model ID for TTS (reference_id from VoiceModel)"
+    )
     callback_url: str = Field(..., description="URL to call back with completion")
     options: Optional[dict] = Field(
         default=None,

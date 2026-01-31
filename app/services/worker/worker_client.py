@@ -176,6 +176,7 @@ class WorkerClient:
         text: str,
         user_id: int,
         voice_model_id: Optional[UUID] = None,
+        voice_reference_id: Optional[str] = None,
         callback_url: str = "",
         options: Optional[dict] = None,
     ) -> WorkerResponse:
@@ -188,6 +189,7 @@ class WorkerClient:
             text: Text to synthesize
             user_id: Owner of the job
             voice_model_id: Voice model for TTS
+            voice_reference_id: Fish Audio model ID for TTS (from VoiceModel.reference_id)
             callback_url: URL for completion callback
             options: Generation options
 
@@ -208,6 +210,8 @@ class WorkerClient:
         }
         if voice_model_id:
             payload["voice_model_id"] = str(voice_model_id)
+        if voice_reference_id:
+            payload["voice_reference_id"] = voice_reference_id
 
         # Include user_id in options for worker
         options = options or {}

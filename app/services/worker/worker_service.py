@@ -231,6 +231,7 @@ class WorkerService:
         text: str,
         user_id: int,
         voice_model_id: Optional[UUID] = None,
+        voice_reference_id: Optional[str] = None,
         callback_url: str = "",
         options: Optional[dict] = None,
     ) -> dict:
@@ -243,6 +244,7 @@ class WorkerService:
             text: Text to synthesize
             user_id: Owner of the job
             voice_model_id: Voice model for TTS
+            voice_reference_id: Fish Audio model ID for TTS (from VoiceModel.reference_id)
             callback_url: URL for completion callback
             options: Generation options
 
@@ -276,8 +278,8 @@ class WorkerService:
             self._ensure_temp_dir()
             output_path = os.path.join(WORKER_TEMP_DIR, f"{video_id}.mp4")
 
-            # Execute video generation
-            ref_file = str(voice_model_id) if voice_model_id else None
+            # Execute video generation - use voice_reference_id (Fish Audio ID) for TTS
+            ref_file = voice_reference_id  # Fish Audio model ID, not voice_model UUID
             result = await livetalking_cli_service.generate_video(
                 avatar_id=str(avatar_id),
                 text=text,

@@ -717,6 +717,7 @@ class AIService:
     ) -> None:
         """Generate video via worker service."""
         from app.services.worker import worker_client
+        from app.models.voice_model import VoiceModel
 
         backend_url = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
         if not backend_url:
@@ -724,12 +725,24 @@ class AIService:
 
         callback_url = f"{backend_url}/api/v1/internal/videos/{video.id}/callback"
 
+        # Look up voice model to get Fish Audio reference_id
+        voice_reference_id = None
+        if video.voice_model_id:
+            voice_model_result = await db.execute(
+                select(VoiceModel).where(VoiceModel.id == video.voice_model_id)
+            )
+            voice_model = voice_model_result.scalar_one_or_none()
+            if voice_model:
+                voice_reference_id = voice_model.reference_id
+                logger.info(f"Using voice reference_id: {voice_reference_id}")
+
         response = await worker_client.submit_video_job(
             video_id=video.id,
             avatar_id=video.video_model_id,
             text=video.input_text,
             user_id=video.user_id,
             voice_model_id=video.voice_model_id,
+            voice_reference_id=voice_reference_id,
             callback_url=callback_url,
         )
 

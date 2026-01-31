@@ -129,6 +129,7 @@ async def submit_video_job(
         avatar_id=request.avatar_id,
         text=request.text,
         voice_model_id=request.voice_model_id,
+        voice_reference_id=request.voice_reference_id,
         callback_url=request.callback_url,
         options=request.options,
     )
@@ -168,6 +169,7 @@ async def _execute_video_job_async(
     avatar_id: UUID,
     text: str,
     voice_model_id: UUID | None,
+    voice_reference_id: str | None,
     callback_url: str,
     options: dict | None,
 ) -> None:
@@ -184,6 +186,7 @@ async def _execute_video_job_async(
             text=text,
             user_id=user_id,
             voice_model_id=voice_model_id,
+            voice_reference_id=voice_reference_id,
             callback_url=callback_url,
             options=options,
         )
