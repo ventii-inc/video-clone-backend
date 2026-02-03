@@ -211,8 +211,17 @@ async def get_download_url(
             detail="Video file not found",
         )
 
-    # Generate filename
-    title_slug = (video.title or "video").lower().replace(" ", "-")[:50]
+    # Generate filename - sanitize to ASCII only for Content-Disposition header compatibility
+    title = video.title or "video"
+    # Remove non-ASCII characters (e.g., Japanese, Chinese, etc.) to avoid S3 header encoding errors
+    title_ascii = title.encode("ascii", "ignore").decode("ascii").strip()
+    # Clean up: replace spaces with dashes, remove multiple consecutive dashes, strip trailing dashes
+    title_slug = title_ascii.lower().replace(" ", "-").strip("-")
+    # Remove multiple consecutive dashes
+    while "--" in title_slug:
+        title_slug = title_slug.replace("--", "-")
+    # Fallback to "video" if title becomes empty after sanitization
+    title_slug = (title_slug or "video")[:50]
     filename = f"{title_slug}-{str(video.id)[:8]}.mp4"
 
     # Generate fresh presigned URL with Content-Disposition header for download
