@@ -463,6 +463,8 @@ class LiveTalkingCLIService:
             "--pads", *pads.split(),
             "--face_det_batch_size", str(face_det_batch_size),
             "--max_frames", str(max_frames),
+            "--save_mask",
+            "--mask_mode", "jaw",
         ]
 
         logger.info(f"Generating avatar with max_frames={max_frames} (silent={silent})")
@@ -606,6 +608,8 @@ class LiveTalkingCLIService:
             "--pads", *pads.split(),
             "--face_det_batch_size", str(face_det_batch_size),
             "--max_frames", str(max_frames),
+            "--save_mask",
+            "--mask_mode", "jaw",
         ]
 
         logger.info(f"Starting detached avatar generation with max_frames={max_frames} (silent={silent})")
