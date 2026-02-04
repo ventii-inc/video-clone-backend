@@ -21,6 +21,7 @@ from app.services.avatar_job import avatar_job_service
 from app.services.video import extract_thumbnail, video_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.training_usage_service import training_usage_service
+from app.services.progress import calculate_video_model_progress, VIDEO_MODEL_ESTIMATED_DURATION
 from app.utils import logger
 from app.schemas.common import MessageResponse, PaginationMeta
 from app.schemas.video_model import (
@@ -97,11 +98,23 @@ async def list_video_models(
     t0 = time.perf_counter()
 
     # Create briefs first without URLs
+    # Also calculate simulated progress for each model (see model_progress.py)
     model_briefs = []
     models_with_thumbnails = []
     for i, m in enumerate(models):
         brief = VideoModelBrief.model_validate(m)
         brief.status = map_public_status(m.status)
+
+        # Calculate simulated progress based on elapsed time
+        progress, stage = calculate_video_model_progress(
+            status=m.status,
+            processing_started_at=m.processing_started_at,
+            stored_progress=m.progress_percent,
+            stored_stage=m.processing_stage,
+        )
+        brief.progress_percent = progress
+        brief.processing_stage = stage
+
         model_briefs.append(brief)
         if m.thumbnail_key:
             models_with_thumbnails.append((i, m.thumbnail_key))
@@ -154,7 +167,21 @@ async def get_video_model(
 ):
     """
     Get video model details by ID.
+
+    Progress Tracking:
+    ------------------
+    Progress is calculated based on elapsed time since processing started.
+    This is a simulated progress (not real training progress) because:
+    1. We don't have real-time progress from the avatar training process
+    2. Estimated duration is ~10 minutes for video model training
+
+    Progress Logic (see app/services/progress/model_progress.py):
+    - Progress caps at 80% while status is "processing"
+    - Only shows 100% when DB status is "completed"
+    - This prevents premature "done" display before model is ready
     """
+    from datetime import datetime
+
     result = await db.execute(
         select(VideoModel).where(
             VideoModel.id == model_id,
@@ -170,6 +197,27 @@ async def get_video_model(
         )
 
     response = VideoModelResponse.model_validate(model)
+
+    # Calculate simulated progress based on elapsed time
+    # (see model_progress.py for detailed logic)
+    progress, stage = calculate_video_model_progress(
+        status=model.status,
+        processing_started_at=model.processing_started_at,
+        stored_progress=model.progress_percent,
+        stored_stage=model.processing_stage,
+    )
+    response.progress_percent = progress
+    response.processing_stage = stage
+
+    # Calculate estimated remaining time (only for processing models)
+    if model.status == "processing" and model.processing_started_at:
+        elapsed = (datetime.utcnow() - model.processing_started_at).total_seconds()
+        remaining = max(0, VIDEO_MODEL_ESTIMATED_DURATION - int(elapsed))
+        # Only show remaining time if progress < 80% (still actively processing)
+        response.estimated_remaining_seconds = remaining if progress < 80 else None
+    else:
+        response.estimated_remaining_seconds = None
+
     # Generate thumbnail URL from thumbnail_key if available
     if model.thumbnail_key:
         response.thumbnail_url = await s3_service.generate_presigned_url(model.thumbnail_key)
@@ -569,8 +617,9 @@ async def process_s3_upload_background_tasks(
     Flow:
     1. Download video from S3 to local disk
     2. Process video (trim 60s, 25fps, remove audio)
-    3. Create avatar job
-    4. Generate thumbnail and trigger avatar processing
+    3. Gemini end-frame analysis + reverse-append loop
+    4. Create avatar job
+    5. Generate thumbnail and trigger avatar processing
     """
     from app.db import get_db_session
 
@@ -631,7 +680,42 @@ async def process_s3_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 3: Create avatar job
+    # Step 3: Gemini end-frame analysis + reverse-append loop
+    try:
+        looped_path, looped_duration = await video_service.analyze_and_loop_video(processed_path)
+        logger.info(f"Video looped: {looped_path} ({looped_duration:.2f}s)")
+
+        # Replace processed video with looped version
+        if looped_path != processed_path:
+            if os.path.exists(processed_path):
+                os.remove(processed_path)
+            os.rename(looped_path, processed_path)
+
+        # Update model with looped video info
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.duration_seconds = int(looped_duration)
+                model.file_size_bytes = os.path.getsize(processed_path)
+                await db.commit()
+
+    except Exception as e:
+        logger.error(f"Gemini analysis/looping failed for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Video analysis/looping failed: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 4: Create avatar job
     try:
         async with get_db_session() as db:
             job = await avatar_job_service.create_job(
@@ -653,7 +737,7 @@ async def process_s3_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 4: Generate thumbnail and trigger avatar processing
+    # Step 5: Generate thumbnail and trigger avatar processing
     async def generate_and_upload_thumbnail():
         try:
             thumbnail_path = await extract_thumbnail(processed_path, timestamp=1.0)
@@ -720,8 +804,9 @@ async def process_upload_background_tasks(
 
     Flow:
     1. Process video (trim 60s, 25fps, remove audio)
-    2. Create avatar job (AFTER video is processed to avoid race condition)
-    3. In parallel: upload to S3, generate thumbnail, trigger avatar processing
+    2. Gemini end-frame analysis + reverse-append loop
+    3. Create avatar job (AFTER video is processed to avoid race condition)
+    4. In parallel: upload to S3, generate thumbnail, trigger avatar processing
     """
     from app.db import get_db_session
 
@@ -763,7 +848,42 @@ async def process_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 2: Create avatar job NOW (after video is processed)
+    # Step 2: Gemini end-frame analysis + reverse-append loop
+    try:
+        looped_path, looped_duration = await video_service.analyze_and_loop_video(processed_path)
+        logger.info(f"Video looped: {looped_path} ({looped_duration:.2f}s)")
+
+        # Replace processed video with looped version
+        if looped_path != processed_path:
+            if os.path.exists(processed_path):
+                os.remove(processed_path)
+            os.rename(looped_path, processed_path)
+
+        # Update model with looped video info
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.duration_seconds = int(looped_duration)
+                model.file_size_bytes = os.path.getsize(processed_path)
+                await db.commit()
+
+    except Exception as e:
+        logger.error(f"Gemini analysis/looping failed for model {model_id}: {e}")
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.FAILED.value
+                model.error_message = f"Video analysis/looping failed: {str(e)}"
+                await db.commit()
+        return
+
+    # Step 3: Create avatar job NOW (after video is processed)
     # This prevents race condition where scheduler picks up job before video processing completes
     try:
         async with get_db_session() as db:
@@ -786,7 +906,7 @@ async def process_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 3: Run S3 upload, thumbnail generation, and avatar processing in parallel
+    # Step 4: Run S3 upload, thumbnail generation, and avatar processing in parallel
     async def upload_to_s3():
         """Upload the processed video file to S3."""
         try:
