@@ -1,7 +1,5 @@
 """Billing router for Stripe integration"""
 
-import logging
-
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -14,8 +12,7 @@ from app.models import User, Subscription
 from app.models.subscription import SubscriptionStatus
 from app.services.firebase import get_current_user
 from app.services.stripe import stripe_service, stripe_settings
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
 

@@ -1,7 +1,6 @@
 """Stripe service for handling payments and subscriptions"""
 
 import asyncio
-import logging
 from datetime import datetime
 from typing import Optional
 
@@ -15,8 +14,7 @@ from app.models.payment_history import PaymentType, PaymentStatus
 from app.services.stripe.stripe_config import stripe_settings
 from app.services.usage_service import usage_service
 from app.utils.constants import PLAN_CONFIG
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class StripeService:

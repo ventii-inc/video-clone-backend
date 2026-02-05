@@ -2,12 +2,11 @@
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 # Maximum duration for training audio (in seconds)
 MAX_TRAINING_AUDIO_DURATION = 60

@@ -1,6 +1,5 @@
 """Usage tracking service for monitoring and managing user credits."""
 
-import logging
 from datetime import datetime
 from uuid import UUID
 
@@ -11,8 +10,7 @@ from app.models.user import User
 from app.models.subscription import Subscription, PlanType
 from app.models.usage_record import UsageRecord
 from app.utils.constants import PLAN_CONFIG
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class UsageService:

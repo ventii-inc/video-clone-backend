@@ -6,7 +6,6 @@ are deployed on the same server.
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 import signal
@@ -20,8 +19,7 @@ from dataclasses import dataclass
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.s3 import s3_service
 from app.services.video import get_video_duration
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 # Frame limits for avatar generation
 MAX_FRAMES_DEFAULT = 1800  # For normal avatars (~1 min at 30fps)

@@ -8,7 +8,6 @@ Set LIVETALKING_MODE=cli in environment to use CLI mode.
 """
 
 import asyncio
-import logging
 import os
 import tempfile
 from datetime import datetime
@@ -31,8 +30,7 @@ from app.services.audio import audio_service, get_audio_duration
 from app.services.livetalking import livetalking_cli_service
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.fish_audio import fish_audio_service
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class AIService:

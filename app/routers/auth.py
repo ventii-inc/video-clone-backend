@@ -1,7 +1,5 @@
 """Authentication router for login and user info"""
 
-import logging
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -15,8 +13,7 @@ from app.services.usage_service import usage_service
 from app.services.training_usage_service import training_usage_service
 from app.schemas.user import LoginResponse, UserResponse, UserWithDetailsResponse, ProfileSummary, SubscriptionSummary
 from app.utils.constants import PLAN_CONFIG
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 

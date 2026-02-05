@@ -1,7 +1,6 @@
 """Firebase authentication middleware and utilities"""
 
 import asyncio
-import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -13,8 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.models.user import User
 from app.services.firebase.firebase_config import get_firebase_app
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 @dataclass

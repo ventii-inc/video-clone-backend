@@ -1,6 +1,5 @@
 """Training usage service for tracking and managing model training limits."""
 
-import logging
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,8 +8,7 @@ from sqlalchemy import select
 from app.models.subscription import Subscription, PlanType
 from app.models.training_usage_record import TrainingUsageRecord
 from app.utils.constants import PLAN_CONFIG
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class TrainingUsageService:

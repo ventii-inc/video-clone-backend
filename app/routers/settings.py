@@ -1,7 +1,6 @@
 """Settings router for user preferences and account management"""
 
 import asyncio
-import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,8 +16,7 @@ from app.services.firebase import get_current_user
 from app.services.s3 import s3_service
 from app.services.abuse_prevention import abuse_prevention_service
 from app.schemas.common import MessageResponse, UploadInfo
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
 

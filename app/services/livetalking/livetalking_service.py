@@ -1,6 +1,5 @@
 """LiveTalking service for real-time avatar streaming"""
 
-import logging
 import tempfile
 from typing import Optional
 from io import BytesIO
@@ -9,8 +8,7 @@ import httpx
 
 from app.services.livetalking.livetalking_config import LiveTalkingSettings
 from app.services.s3 import s3_service
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class LiveTalkingService:

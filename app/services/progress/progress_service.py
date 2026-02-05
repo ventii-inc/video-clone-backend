@@ -7,7 +7,6 @@ Progress ranges:
 - 80-100%: Finalizing (uploading results) - only reaches 100% on completion
 """
 
-import logging
 import math
 from datetime import datetime
 from typing import Optional
@@ -17,8 +16,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.video_model import VideoModel, ProcessingStage
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 # Progress range constants
 PROGRESS_UPLOAD_START = 0

@@ -1,7 +1,6 @@
 """Abuse prevention service for tracking free plan usage and preventing abuse."""
 
 import hashlib
-import logging
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,8 +8,7 @@ from sqlalchemy import select
 
 from app.models.deleted_account_record import DeletedAccountRecord
 from app.models.subscription import Subscription
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class AbusePreventionService:

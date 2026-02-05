@@ -1,6 +1,5 @@
 """S3 service for uploading and managing media files"""
 
-import logging
 import os
 from typing import Optional
 
@@ -9,8 +8,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from app.services.s3.s3_config import S3Settings
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class S3Service:

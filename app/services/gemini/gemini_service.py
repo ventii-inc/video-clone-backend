@@ -1,7 +1,6 @@
 """Gemini AI service for video end-frame analysis"""
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -9,8 +8,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from app.services.gemini.gemini_config import GeminiSettings
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class EndFrameAnalysis(BaseModel):
