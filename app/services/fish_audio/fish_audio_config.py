@@ -28,5 +28,16 @@ class FishAudioSettings(BaseSettings):
         os.getenv("FISH_AUDIO_ENHANCE_QUALITY", "true").lower() == "true"
     )
 
+    # TTS generation parameters (low values = more deterministic, less repetition)
+    FISH_AUDIO_TEMPERATURE: float = float(os.getenv("FISH_AUDIO_TEMPERATURE", "0.01"))
+    FISH_AUDIO_TOP_P: float = float(os.getenv("FISH_AUDIO_TOP_P", "0.01"))
+    FISH_AUDIO_CHUNK_LENGTH: int = int(os.getenv("FISH_AUDIO_CHUNK_LENGTH", "200"))
+    FISH_AUDIO_SPEED: float = float(os.getenv("FISH_AUDIO_SPEED", "1.0"))
+    FISH_AUDIO_VOLUME: float = float(os.getenv("FISH_AUDIO_VOLUME", "0.0"))
+    FISH_AUDIO_NORMALIZE: bool = (
+        os.getenv("FISH_AUDIO_NORMALIZE", "true").lower() == "true"
+    )
+    FISH_AUDIO_LATENCY: str = os.getenv("FISH_AUDIO_LATENCY", "normal")
+
     class Config:
         env_prefix = ""

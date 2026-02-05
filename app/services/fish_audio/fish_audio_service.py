@@ -1,6 +1,8 @@
 """Fish Audio service for voice cloning and text-to-speech"""
 
+import os
 import tempfile
+import uuid
 from typing import Optional
 from dataclasses import dataclass
 
@@ -266,11 +268,21 @@ class FishAudioService:
                     "text": text,
                     "reference_id": reference_id,
                     "format": format,
+                    # TTS generation parameters for deterministic output
+                    "temperature": self.settings.FISH_AUDIO_TEMPERATURE,
+                    "top_p": self.settings.FISH_AUDIO_TOP_P,
+                    "chunk_length": self.settings.FISH_AUDIO_CHUNK_LENGTH,
+                    "speed": self.settings.FISH_AUDIO_SPEED,
+                    "volume": self.settings.FISH_AUDIO_VOLUME,
+                    "normalize": self.settings.FISH_AUDIO_NORMALIZE,
+                    "latency": self.settings.FISH_AUDIO_LATENCY,
                 }
 
                 logger.info(
                     f"Generating TTS with Fish Audio, "
-                    f"reference_id={reference_id}, text_length={len(text)}"
+                    f"reference_id={reference_id}, text_length={len(text)}, "
+                    f"temperature={self.settings.FISH_AUDIO_TEMPERATURE}, "
+                    f"top_p={self.settings.FISH_AUDIO_TOP_P}"
                 )
 
                 response = await client.post(
@@ -290,9 +302,14 @@ class FishAudioService:
                     logger.error(error_msg)
                     return TTSResponse(success=False, error=error_msg)
 
-                # Save audio to file
+                # Save audio to job-specific directory to prevent race conditions
+                # when multiple jobs run concurrently
                 if output_path is None:
-                    output_path = tempfile.mktemp(suffix=f".{format}")
+                    job_dir = os.path.join(
+                        tempfile.gettempdir(), "fish_audio_tts", str(uuid.uuid4())
+                    )
+                    os.makedirs(job_dir, exist_ok=True)
+                    output_path = os.path.join(job_dir, f"audio.{format}")
 
                 with open(output_path, "wb") as f:
                     f.write(response.content)
