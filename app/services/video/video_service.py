@@ -2,13 +2,12 @@
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 import tempfile
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 # Maximum duration for training videos (in seconds)
 MAX_TRAINING_VIDEO_DURATION = 60
