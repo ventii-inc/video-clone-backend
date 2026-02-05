@@ -11,6 +11,8 @@ from app.schemas.common import UploadInfo, PaginationMeta
 ModelStatus = Literal["pending", "uploading", "processing", "completed", "failed"]
 SourceType = Literal["upload", "recording"]
 Visibility = Literal["private", "public", "unlist"]
+# Voice model processing stages (for progress UI)
+ProcessingStage = Literal["pending", "uploading", "analyzing", "extracting", "training", "finalizing", "completed", "failed"]
 
 
 class VoiceModelCreate(BaseModel):
@@ -42,6 +44,10 @@ class VoiceModelResponse(BaseModel):
     duration_seconds: int | None
     file_size_bytes: int | None
     status: ModelStatus
+    # Progress tracking fields (calculated from elapsed time, see model_progress.py)
+    progress_percent: int = 0
+    processing_stage: ProcessingStage = "pending"
+    estimated_remaining_seconds: int | None = None
     visibility: Visibility = "private"
     error_message: str | None = None
     processing_started_at: datetime | None = None
@@ -60,6 +66,9 @@ class VoiceModelBrief(BaseModel):
     source_type: SourceType
     duration_seconds: int | None
     status: ModelStatus
+    # Progress tracking fields (calculated from elapsed time, see model_progress.py)
+    progress_percent: int = 0
+    processing_stage: ProcessingStage = "pending"
     visibility: Visibility = "private"
     created_at: datetime
 

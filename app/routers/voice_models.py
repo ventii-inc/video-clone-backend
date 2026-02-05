@@ -17,6 +17,7 @@ from app.services.s3 import s3_service
 from app.services.ai import ai_service
 from app.services.fish_audio import fish_audio_service
 from app.services.training_usage_service import training_usage_service
+from app.services.progress import calculate_voice_model_progress, VOICE_MODEL_ESTIMATED_DURATION
 from app.schemas.common import MessageResponse, PaginationMeta, UploadInfo
 from app.schemas.voice_model import (
     VoiceModelCreate,
@@ -83,8 +84,25 @@ async def list_voice_models(
     result = await db.execute(query)
     models = result.scalars().all()
 
+    # Create briefs with calculated progress (see model_progress.py)
+    model_briefs = []
+    for m in models:
+        brief = VoiceModelBrief.model_validate(m)
+
+        # Calculate simulated progress based on elapsed time
+        progress, stage = calculate_voice_model_progress(
+            status=m.status,
+            processing_started_at=m.processing_started_at,
+            stored_progress=0,  # Voice models don't store progress in DB yet
+            stored_stage="pending",
+        )
+        brief.progress_percent = progress
+        brief.processing_stage = stage
+
+        model_briefs.append(brief)
+
     return VoiceModelListResponse(
-        models=[VoiceModelBrief.model_validate(m) for m in models],
+        models=model_briefs,
         pagination=PaginationMeta(
             page=page,
             limit=limit,
@@ -102,7 +120,21 @@ async def get_voice_model(
 ):
     """
     Get voice model details by ID.
+
+    Progress Tracking:
+    ------------------
+    Progress is calculated based on elapsed time since processing started.
+    This is a simulated progress (not real cloning progress) because:
+    1. Fish Audio API doesn't provide real-time training progress
+    2. Estimated duration is ~2 minutes for voice cloning
+
+    Progress Logic (see app/services/progress/model_progress.py):
+    - Progress caps at 80% while status is "processing"
+    - Only shows 100% when DB status is "completed"
+    - This prevents premature "done" display before model is ready
     """
+    from datetime import datetime
+
     result = await db.execute(
         select(VoiceModel).where(
             VoiceModel.id == model_id,
@@ -117,7 +149,29 @@ async def get_voice_model(
             detail="Voice model not found",
         )
 
-    return VoiceModelResponse.model_validate(model)
+    response = VoiceModelResponse.model_validate(model)
+
+    # Calculate simulated progress based on elapsed time
+    # (see model_progress.py for detailed logic)
+    progress, stage = calculate_voice_model_progress(
+        status=model.status,
+        processing_started_at=model.processing_started_at,
+        stored_progress=0,  # Voice models don't store progress in DB yet
+        stored_stage="pending",
+    )
+    response.progress_percent = progress
+    response.processing_stage = stage
+
+    # Calculate estimated remaining time (only for processing models)
+    if model.status == "processing" and model.processing_started_at:
+        elapsed = (datetime.utcnow() - model.processing_started_at).total_seconds()
+        remaining = max(0, VOICE_MODEL_ESTIMATED_DURATION - int(elapsed))
+        # Only show remaining time if progress < 80% (still actively processing)
+        response.estimated_remaining_seconds = remaining if progress < 80 else None
+    else:
+        response.estimated_remaining_seconds = None
+
+    return response
 
 
 @router.post("", response_model=VoiceModelCreateResponse, status_code=status.HTTP_201_CREATED)
