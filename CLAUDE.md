@@ -55,6 +55,11 @@ Optional environment variables:
 - `LIPSYNC_API_KEY` - API key for authenticating with LipSync service
 - `LIPSYNC_TIMEOUT` - Request timeout in seconds (default: 30)
 - `BACKEND_PUBLIC_URL` - Public URL of this backend for callbacks (required for remote/worker mode)
+- `GEMINI_API_KEY` - Google Gemini API key for video end-frame analysis (required for video processing)
+- `GEMINI_MODEL` - Gemini model to use (default: `gemini-2.5-flash`)
+- `GEMINI_TIMEOUT` - Gemini API request timeout in seconds (default: 60)
+- `GEMINI_FILE_PROCESSING_TIMEOUT` - Timeout for Gemini file upload processing in seconds (default: 120)
+- `GEMINI_FILE_POLL_INTERVAL` - Poll interval when waiting for Gemini file processing in seconds (default: 3)
 
 **Dual-Mode Backend (API ↔ Worker):**
 - `BACKEND_MODE` - Deployment mode: `api` (default, full app) or `worker` (minimal, CLI-focused)
@@ -86,6 +91,7 @@ Optional environment variables:
 - `s3/` - S3 file uploads, downloads, presigned URLs
 - `stripe/` - Stripe payments, subscriptions, webhooks
 - `fish_audio/` - Voice cloning and TTS via Fish Audio API
+- `gemini/` - Gemini AI video analysis for end-frame detection and loop creation
 - `livetalking/` - Avatar generation via CLI subprocess or RunPod API
 - `lipsync_client/` - Client for remote Lip-Sync-Experiment service
 - `worker/` - Dual-mode worker client/service (API ↔ Worker communication)

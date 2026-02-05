@@ -275,6 +275,185 @@ async def extract_thumbnail(
         return None
 
 
+async def trim_video_to_timestamp(
+    input_path: str,
+    output_path: str,
+    end_seconds: float,
+) -> bool:
+    """
+    Trim video to an exact timestamp using re-encoding for frame-accurate cut.
+
+    Args:
+        input_path: Path to input video file
+        output_path: Path for trimmed output video
+        end_seconds: End timestamp in seconds
+
+    Returns:
+        True if successful, False on error
+    """
+    logger.info(f"Trimming video to {end_seconds:.2f}s: {input_path}")
+
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+            "-t", str(end_seconds),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-an",
+            output_path,
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"FFmpeg trim-to-timestamp failed: {stderr.decode()}")
+            return False
+
+        if not os.path.exists(output_path):
+            logger.error(f"Trimmed video not created: {output_path}")
+            return False
+
+        logger.info(f"Video trimmed to {end_seconds:.2f}s: {output_path}")
+        return True
+
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Please install FFmpeg.")
+        return False
+    except Exception as e:
+        logger.error(f"Error trimming video to timestamp: {e}")
+        return False
+
+
+async def reverse_video(input_path: str, output_path: str) -> bool:
+    """
+    Create a reversed copy of a video using ffmpeg reverse filter.
+
+    Note: The reverse filter buffers the entire video in memory.
+    Only suitable for short videos (<=60s).
+
+    Args:
+        input_path: Path to input video file
+        output_path: Path for reversed output video
+
+    Returns:
+        True if successful, False on error
+    """
+    logger.info(f"Reversing video: {input_path}")
+
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+            "-vf", "reverse",
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            output_path,
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"FFmpeg reverse failed: {stderr.decode()}")
+            return False
+
+        if not os.path.exists(output_path):
+            logger.error(f"Reversed video not created: {output_path}")
+            return False
+
+        logger.info(f"Video reversed: {output_path}")
+        return True
+
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Please install FFmpeg.")
+        return False
+    except Exception as e:
+        logger.error(f"Error reversing video: {e}")
+        return False
+
+
+async def concat_videos(input_paths: list[str], output_path: str) -> bool:
+    """
+    Concatenate multiple videos using ffmpeg concat demuxer.
+
+    All input videos must have the same codec, resolution, and framerate.
+
+    Args:
+        input_paths: List of paths to input video files
+        output_path: Path for concatenated output video
+
+    Returns:
+        True if successful, False on error
+    """
+    if not input_paths:
+        logger.error("No input paths provided for concatenation")
+        return False
+
+    logger.info(f"Concatenating {len(input_paths)} videos: {output_path}")
+
+    # Create concat list file
+    fd, list_path = tempfile.mkstemp(suffix=".txt")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for path in input_paths:
+                # Escape single quotes in path for ffmpeg concat format
+                escaped = path.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            output_path,
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"FFmpeg concat failed: {stderr.decode()}")
+            return False
+
+        if not os.path.exists(output_path):
+            logger.error(f"Concatenated video not created: {output_path}")
+            return False
+
+        logger.info(f"Videos concatenated: {output_path}")
+        return True
+
+    except FileNotFoundError:
+        logger.error("ffmpeg not found. Please install FFmpeg.")
+        return False
+    except Exception as e:
+        logger.error(f"Error concatenating videos: {e}")
+        return False
+    finally:
+        if os.path.exists(list_path):
+            os.remove(list_path)
+
+
 class VideoService:
     """Service for video processing operations"""
 
@@ -377,6 +556,117 @@ class VideoService:
             raise
         except Exception as e:
             raise ValueError(f"Error processing video: {e}")
+
+    async def analyze_and_loop_video(
+        self,
+        processed_path: str,
+    ) -> tuple[str, float]:
+        """
+        Analyze video with Gemini for end-frame anomalies, optionally trim,
+        then create a reverse-append loop.
+
+        Steps:
+        1. Upload to Gemini for end-frame analysis
+        2. If anomaly detected, trim to the suggested timestamp
+        3. Create reversed copy
+        4. Concatenate original + reversed for seamless loop
+
+        Args:
+            processed_path: Path to the processed (trimmed/fps-converted) video
+
+        Returns:
+            Tuple of (looped_video_path, looped_duration_seconds)
+
+        Raises:
+            ValueError: If Gemini analysis or ffmpeg operations fail
+        """
+        from app.services.gemini import gemini_service
+
+        intermediate_files = []
+
+        try:
+            # Step 1: Gemini analysis
+            result = await gemini_service.analyze_end_frames(processed_path)
+            if not result.success:
+                raise ValueError(f"Gemini analysis failed: {result.error}")
+
+            analysis = result.analysis
+            source_path = processed_path
+
+            # Step 2: Trim if anomaly detected
+            if analysis.has_anomaly and analysis.trim_to_seconds is not None:
+                trim_seconds = analysis.trim_to_seconds
+
+                # Validate trim point
+                video_info = await get_video_info(processed_path)
+                if video_info is None:
+                    raise ValueError("Could not determine video info for trimming")
+
+                duration = video_info["duration"]
+                if trim_seconds < 3.0:
+                    trim_seconds = 3.0
+                if trim_seconds >= duration:
+                    logger.info(
+                        f"Trim point ({trim_seconds}s) >= duration ({duration}s), "
+                        f"skipping end trim"
+                    )
+                else:
+                    base, ext = os.path.splitext(processed_path)
+                    trimmed_path = f"{base}_trimmed{ext}"
+                    intermediate_files.append(trimmed_path)
+
+                    success = await trim_video_to_timestamp(
+                        processed_path, trimmed_path, trim_seconds
+                    )
+                    if not success:
+                        raise ValueError(
+                            f"Failed to trim video to {trim_seconds}s"
+                        )
+
+                    source_path = trimmed_path
+                    logger.info(
+                        f"Trimmed anomalous end: {duration:.2f}s -> {trim_seconds:.2f}s"
+                    )
+            else:
+                logger.info("No end-frame anomaly detected, skipping trim")
+
+            # Step 3: Create reversed copy
+            base, ext = os.path.splitext(source_path)
+            reversed_path = f"{base}_reversed{ext}"
+            intermediate_files.append(reversed_path)
+
+            success = await reverse_video(source_path, reversed_path)
+            if not success:
+                raise ValueError("Failed to create reversed video")
+
+            # Step 4: Concatenate original + reversed
+            base, ext = os.path.splitext(processed_path)
+            looped_path = f"{base}_looped{ext}"
+
+            success = await concat_videos(
+                [source_path, reversed_path], looped_path
+            )
+            if not success:
+                raise ValueError("Failed to concatenate videos for loop")
+
+            # Get final duration
+            looped_duration = await get_video_duration(looped_path)
+            if looped_duration is None:
+                raise ValueError("Could not determine looped video duration")
+
+            logger.info(
+                f"Video loop created: {looped_path} ({looped_duration:.2f}s)"
+            )
+            return looped_path, looped_duration
+
+        finally:
+            # Clean up intermediate files
+            for path in intermediate_files:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError as e:
+                        logger.warning(f"Failed to clean up {path}: {e}")
 
     @staticmethod
     def is_ffmpeg_available() -> bool:
