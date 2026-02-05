@@ -9,8 +9,10 @@ from app.services.progress.progress_service import (
 from app.services.progress.model_progress import (
     calculate_video_model_progress,
     calculate_voice_model_progress,
+    calculate_generated_video_progress,
     VIDEO_MODEL_ESTIMATED_DURATION,
     VOICE_MODEL_ESTIMATED_DURATION,
+    VIDEO_GENERATION_ESTIMATED_DURATION,
 )
 
 __all__ = [
@@ -20,6 +22,8 @@ __all__ = [
     "calculate_expected_generation_time",
     "calculate_video_model_progress",
     "calculate_voice_model_progress",
+    "calculate_generated_video_progress",
     "VIDEO_MODEL_ESTIMATED_DURATION",
     "VOICE_MODEL_ESTIMATED_DURATION",
+    "VIDEO_GENERATION_ESTIMATED_DURATION",
 ]

@@ -15,6 +15,10 @@ from app.services.firebase import get_current_user
 from app.services.ai import ai_service
 from app.services.s3 import s3_service
 from app.services.usage_service import usage_service
+from app.services.progress import (
+    calculate_generated_video_progress,
+    VIDEO_GENERATION_ESTIMATED_DURATION,
+)
 from app.schemas.generated_video import (
     GenerateVideoRequest,
     GenerateVideoResponse,
@@ -175,7 +179,10 @@ async def get_generation_status(
     Get current generation status.
 
     Used for polling during video generation.
+    Uses simulated progress based on elapsed time for smooth updates.
     """
+    from datetime import datetime
+
     result = await db.execute(
         select(GeneratedVideo).where(
             GeneratedVideo.id == video_id,
@@ -190,13 +197,27 @@ async def get_generation_status(
             detail="Generated video not found",
         )
 
-    # Estimate remaining time if processing
+    # Calculate simulated progress based on elapsed time
+    # This provides smooth 1% increments during worker mode processing
+    progress_percent, processing_stage = calculate_generated_video_progress(
+        status=video.status,
+        processing_started_at=video.processing_started_at,
+        stored_progress=video.progress_percent or 0,
+        stored_stage=video.processing_stage or "queued",
+        input_text=video.input_text,
+    )
+
+    # Calculate estimated remaining time based on actual elapsed time
     estimated_remaining = None
-    if video.status == GenerationStatus.PROCESSING.value and video.progress_percent:
-        # Rough estimate based on progress
-        if video.progress_percent > 0:
-            elapsed = 10  # Assume ~10 seconds have passed
-            estimated_remaining = int(elapsed * (100 - video.progress_percent) / video.progress_percent)
+    if video.status == GenerationStatus.PROCESSING.value and video.processing_started_at:
+        elapsed = (datetime.utcnow() - video.processing_started_at).total_seconds()
+        # Estimate total duration based on progress (cap at 78% for estimation)
+        if progress_percent > 0 and progress_percent < 78:
+            estimated_total = (elapsed / progress_percent) * 100
+            estimated_remaining = max(0, int(estimated_total - elapsed))
+        elif progress_percent >= 78:
+            # Near completion, show small remaining time
+            estimated_remaining = 30
 
     # Generate presigned URL for completed videos
     output_video_url = None
@@ -210,9 +231,9 @@ async def get_generation_status(
         video=GenerationStatusDetail(
             id=video.id,
             status=video.status,
-            processing_stage=video.processing_stage,
+            processing_stage=processing_stage,
             queue_position=video.queue_position,
-            progress_percent=video.progress_percent,
+            progress_percent=progress_percent,
             estimated_remaining_seconds=estimated_remaining,
             output_video_url=output_video_url,
             thumbnail_url=video.thumbnail_url,

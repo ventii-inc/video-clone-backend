@@ -36,6 +36,7 @@ from typing import Tuple
 # Configuration: Estimated total processing time in seconds
 VIDEO_MODEL_ESTIMATED_DURATION = 600  # 10 minutes for video model (avatar training)
 VOICE_MODEL_ESTIMATED_DURATION = 120  # 2 minutes for voice model (voice cloning)
+VIDEO_GENERATION_ESTIMATED_DURATION = 180  # 3 minutes for video generation (TTS + lip-sync)
 
 # Maximum progress to show while still processing (prevents showing 100% too early)
 MAX_PROCESSING_PROGRESS = 80
@@ -260,3 +261,145 @@ def _estimate_progress_at_failure(
     progress = max(progress, 0)
 
     return progress, "failed"
+
+
+def calculate_generated_video_progress(
+    status: str,
+    processing_started_at: datetime | None,
+    stored_progress: int = 0,
+    stored_stage: str = "queued",
+    input_text: str | None = None,
+) -> Tuple[int, str]:
+    """
+    Calculate simulated progress for video generation (TTS + lip-sync).
+
+    Provides smooth 1% increments based on elapsed time, capped at 78%
+    to leave room for actual completion at 100%.
+
+    Args:
+        status: Current generation status (queued, processing, completed, failed)
+        processing_started_at: When processing started (from DB)
+        stored_progress: Progress value stored in DB (used as minimum)
+        stored_stage: Processing stage stored in DB
+        input_text: Optional input text to estimate duration based on word count
+
+    Returns:
+        Tuple of (progress_percent, processing_stage)
+
+    Progress Timeline (for ~180 second estimated duration):
+        - 0-10s:    5% → 10%   (preparing)
+        - 10-180s:  10% → 78%  (generating) - ~0.4% per second
+        - 180s+:    78%        (capped until completion)
+    """
+    # Completed videos always show 100%
+    if status == "completed":
+        return 100, "completed"
+
+    # Failed videos show where they failed
+    if status == "failed":
+        if stored_progress > 0:
+            return stored_progress, stored_stage
+        return _estimate_progress_at_failure(
+            processing_started_at, VIDEO_GENERATION_ESTIMATED_DURATION
+        )
+
+    # Queued - use stored values (early stage)
+    if status == "queued":
+        return stored_progress, stored_stage
+
+    # Processing - calculate smooth time-based progress
+    if status == "processing":
+        if not processing_started_at:
+            return max(stored_progress, 5), stored_stage or "preparing"
+
+        # Calculate estimated duration based on text length if provided
+        estimated_duration = _estimate_video_generation_duration(input_text)
+
+        progress, stage = _calculate_smooth_video_generation_progress(
+            processing_started_at,
+            estimated_duration,
+        )
+
+        # Never go backwards - use max of stored and calculated
+        return max(progress, stored_progress), stage
+
+    # Unknown status - return stored values
+    return stored_progress, stored_stage
+
+
+def _estimate_video_generation_duration(input_text: str | None) -> int:
+    """
+    Estimate video generation duration based on input text length.
+
+    Args:
+        input_text: The text to be converted to speech
+
+    Returns:
+        Estimated duration in seconds
+
+    Formula:
+        - Base: 120 seconds for up to 100 words
+        - Additional: +20 seconds per 50 words beyond 100
+        - Maximum: 600 seconds (10 minutes)
+    """
+    if not input_text:
+        return VIDEO_GENERATION_ESTIMATED_DURATION  # Default 180 seconds
+
+    word_count = len(input_text.split())
+
+    if word_count <= 100:
+        return 120  # 2 minutes for short texts
+
+    # Add time for longer texts
+    additional_words = word_count - 100
+    additional_time = (additional_words // 50) * 20
+
+    return min(120 + additional_time, 600)
+
+
+def _calculate_smooth_video_generation_progress(
+    started_at: datetime,
+    estimated_duration: int,
+) -> Tuple[int, str]:
+    """
+    Calculate smooth progress that increases by ~1% at regular intervals.
+
+    Progress phases:
+        Phase 1 (0-10s):  5% → 10%  - Preparing
+        Phase 2 (10s+):   10% → 78% - Generating (smooth increment)
+
+    The progress increases smoothly within each phase, providing
+    granular 1% updates rather than large jumps.
+
+    Args:
+        started_at: When processing started
+        estimated_duration: Estimated total duration in seconds
+
+    Returns:
+        Tuple of (progress_percent, processing_stage)
+    """
+    now = datetime.utcnow()
+    elapsed = (now - started_at).total_seconds()
+
+    # Phase 1: 0-10 seconds → 5% to 10% (preparing)
+    if elapsed < 10:
+        # Linear from 5% to 10% over 10 seconds (0.5% per second)
+        progress = 5 + int(elapsed * 0.5)
+        return min(progress, 10), "preparing"
+
+    # Phase 2: 10+ seconds → 10% to 78% (generating)
+    # Calculate how long this phase should take
+    generation_phase_duration = estimated_duration - 10  # Time after first 10 seconds
+    generation_phase_duration = max(generation_phase_duration, 60)  # At least 60 seconds
+
+    phase_elapsed = elapsed - 10
+
+    # Linear progress from 10% to 78% (68 percentage points)
+    # This gives roughly 1% every (duration/68) seconds
+    progress_in_phase = (phase_elapsed / generation_phase_duration) * 68
+    progress = 10 + int(progress_in_phase)
+
+    # Cap at 78% - leave room for completion
+    progress = min(progress, 78)
+
+    return progress, "generating"
