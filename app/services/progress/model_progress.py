@@ -287,7 +287,7 @@ def calculate_generated_video_progress(
         Tuple of (progress_percent, processing_stage)
 
     Progress Timeline (for ~180 second estimated duration):
-        - 0-10s:    5% → 10%   (preparing)
+        - 0-10s:    1% → 10%   (preparing) - ~1% per second
         - 10-180s:  10% → 78%  (generating) - ~0.4% per second
         - 180s+:    78%        (capped until completion)
     """
@@ -310,7 +310,7 @@ def calculate_generated_video_progress(
     # Processing - calculate smooth time-based progress
     if status == "processing":
         if not processing_started_at:
-            return max(stored_progress, 5), stored_stage or "preparing"
+            return max(stored_progress, 1), stored_stage or "preparing"
 
         # Calculate estimated duration based on text length if provided
         estimated_duration = _estimate_video_generation_duration(input_text)
@@ -365,7 +365,7 @@ def _calculate_smooth_video_generation_progress(
     Calculate smooth progress that increases by ~1% at regular intervals.
 
     Progress phases:
-        Phase 1 (0-10s):  5% → 10%  - Preparing
+        Phase 1 (0-10s):  1% → 10%  - Preparing
         Phase 2 (10s+):   10% → 78% - Generating (smooth increment)
 
     The progress increases smoothly within each phase, providing
@@ -381,10 +381,10 @@ def _calculate_smooth_video_generation_progress(
     now = datetime.utcnow()
     elapsed = (now - started_at).total_seconds()
 
-    # Phase 1: 0-10 seconds → 5% to 10% (preparing)
+    # Phase 1: 0-10 seconds → 1% to 10% (preparing)
     if elapsed < 10:
-        # Linear from 5% to 10% over 10 seconds (0.5% per second)
-        progress = 5 + int(elapsed * 0.5)
+        # Linear from 1% to 10% over 10 seconds (0.9% per second)
+        progress = 1 + int(elapsed * 0.9)
         return min(progress, 10), "preparing"
 
     # Phase 2: 10+ seconds → 10% to 78% (generating)
