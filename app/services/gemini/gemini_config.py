@@ -11,7 +11,7 @@ class GeminiSettings(BaseSettings):
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
     # Model to use for video analysis
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
     # Timeout for Gemini API requests (seconds)
     GEMINI_TIMEOUT: int = int(os.getenv("GEMINI_TIMEOUT", "60"))
