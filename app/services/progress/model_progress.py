@@ -286,10 +286,10 @@ def calculate_generated_video_progress(
     Returns:
         Tuple of (progress_percent, processing_stage)
 
-    Progress Timeline (for ~180 second estimated duration):
-        - 0-10s:    1% → 10%   (preparing) - ~1% per second
-        - 10-180s:  10% → 78%  (generating) - ~0.4% per second
-        - 180s+:    78%        (capped until completion)
+    Progress Timeline (slower, irregular intervals):
+        - 0-10s:    1% → 5%    (preparing) - slow increment
+        - 10s+:     5% → 78%   (generating) - irregular 1-3% bumps every 7-30s
+        - 220s+:    78%        (capped until completion)
     """
     # Completed videos always show 100%
     if status == "completed":
@@ -362,18 +362,18 @@ def _calculate_smooth_video_generation_progress(
     estimated_duration: int,
 ) -> Tuple[int, str]:
     """
-    Calculate smooth progress that increases by ~1% at regular intervals.
+    Calculate progress with slower, irregular increments for natural feel.
 
     Progress phases:
-        Phase 1 (0-10s):  1% → 10%  - Preparing
-        Phase 2 (10s+):   10% → 78% - Generating (smooth increment)
+        Phase 1 (0-10s):  1% → 5%   - Preparing (slow)
+        Phase 2 (10s+):   5% → 78%  - Generating (irregular intervals)
 
-    The progress increases smoothly within each phase, providing
-    granular 1% updates rather than large jumps.
+    Uses predefined time buckets with varying intervals and increment sizes
+    to create natural-feeling progress that appears random but is deterministic.
 
     Args:
         started_at: When processing started
-        estimated_duration: Estimated total duration in seconds
+        estimated_duration: Estimated total duration in seconds (unused, kept for API)
 
     Returns:
         Tuple of (progress_percent, processing_stage)
@@ -381,25 +381,46 @@ def _calculate_smooth_video_generation_progress(
     now = datetime.utcnow()
     elapsed = (now - started_at).total_seconds()
 
-    # Phase 1: 0-10 seconds → 1% to 10% (preparing)
+    # Phase 1: 0-10 seconds → 1% to 5% (preparing)
     if elapsed < 10:
-        # Linear from 1% to 10% over 10 seconds (0.9% per second)
-        progress = 1 + int(elapsed * 0.9)
-        return min(progress, 10), "preparing"
+        # Slow increment: ~0.4% per second
+        progress = 1 + int(elapsed * 0.4)
+        return min(progress, 5), "preparing"
 
-    # Phase 2: 10+ seconds → 10% to 78% (generating)
-    # Calculate how long this phase should take
-    generation_phase_duration = estimated_duration - 10  # Time after first 10 seconds
-    generation_phase_duration = max(generation_phase_duration, 60)  # At least 60 seconds
-
+    # Phase 2: 10+ seconds → 5% to 78% (generating)
+    # Use irregular time buckets for natural-feeling progression
+    # Each tuple: (elapsed_since_phase2_start, progress_percent)
     phase_elapsed = elapsed - 10
 
-    # Linear progress from 10% to 78% (68 percentage points)
-    # This gives roughly 1% every (duration/68) seconds
-    progress_in_phase = (phase_elapsed / generation_phase_duration) * 68
-    progress = 10 + int(progress_in_phase)
+    # Irregular progression buckets: (time_threshold, progress_at_threshold)
+    # Creates varying intervals (7s, 8s, 10s, 15s, etc.) and increments (2%, 3%, 5%, etc.)
+    PROGRESS_BUCKETS = [
+        (0, 5),       # Start at 5%
+        (8, 7),       # +2% over 8s
+        (15, 9),      # +2% over 7s
+        (25, 12),     # +3% over 10s
+        (35, 15),     # +3% over 10s
+        (50, 20),     # +5% over 15s
+        (70, 27),     # +7% over 20s
+        (95, 35),     # +8% over 25s
+        (120, 45),    # +10% over 25s
+        (150, 55),    # +10% over 30s
+        (180, 65),    # +10% over 30s
+        (220, 72),    # +7% over 40s
+        (999999, 78), # Cap at 78%
+    ]
 
-    # Cap at 78% - leave room for completion
-    progress = min(progress, 78)
+    # Find current bucket and interpolate within it
+    prev_time, prev_progress = 0, 5
+    for bucket_time, bucket_progress in PROGRESS_BUCKETS:
+        if phase_elapsed < bucket_time:
+            # Interpolate within this bucket
+            bucket_duration = bucket_time - prev_time
+            bucket_increment = bucket_progress - prev_progress
+            time_in_bucket = phase_elapsed - prev_time
+            progress = prev_progress + int((time_in_bucket / bucket_duration) * bucket_increment)
+            return min(progress, 78), "generating"
+        prev_time, prev_progress = bucket_time, bucket_progress
 
-    return progress, "generating"
+    # Fallback: cap at 78%
+    return 78, "generating"
