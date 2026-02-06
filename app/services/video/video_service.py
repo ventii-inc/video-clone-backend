@@ -299,7 +299,7 @@ async def trim_video_to_timestamp(
             "-i", input_path,
             "-t", str(end_seconds),
             "-c:v", "libx264",
-            "-preset", "medium",
+            "-preset", "ultrafast",
             "-crf", "23",
             "-an",
             output_path,
@@ -310,7 +310,15 @@ async def trim_video_to_timestamp(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=300
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            logger.error(f"FFmpeg trim-to-timestamp timed out after 300s")
+            return False
 
         if process.returncode != 0:
             logger.error(f"FFmpeg trim-to-timestamp failed: {stderr.decode()}")
@@ -386,7 +394,7 @@ async def reverse_video(input_path: str, output_path: str, chunk_seconds: int = 
                 "-vf", "reverse",
                 "-an",
                 "-c:v", "libx264",
-                "-preset", "fast",
+                "-preset", "ultrafast",
                 "-crf", "23",
                 chunk_path,
             ]
@@ -602,7 +610,7 @@ class VideoService:
         # Output settings
         cmd.extend([
             "-c:v", "libx264",
-            "-preset", "medium",
+            "-preset", "ultrafast",
             "-crf", "23",
             output_path,
         ])
@@ -618,7 +626,14 @@ class VideoService:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=300
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                raise ValueError(f"FFmpeg processing timed out after 300s: {input_path}")
 
             if process.returncode != 0:
                 logger.error(f"FFmpeg processing failed: {stderr.decode()}")
