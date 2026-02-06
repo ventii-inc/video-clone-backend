@@ -632,6 +632,23 @@ async def process_s3_upload_background_tasks(
 
     from app.db import get_db_session
 
+    # Transition status from "uploading" to "processing"
+    try:
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.PROCESSING.value
+                model.processing_stage = ProcessingStage.PREPARING.value
+                model.progress_percent = 5
+                from datetime import datetime
+                model.processing_started_at = datetime.utcnow()
+                await db.commit()
+    except Exception as e:
+        logger.error(f"Failed to update status to processing for model {model_id}: {e}")
+
     # Step 1: Download from S3
     try:
         step_start = time_module.perf_counter()
@@ -825,6 +842,23 @@ async def process_upload_background_tasks(
     4. In parallel: upload to S3, generate thumbnail, trigger avatar processing
     """
     from app.db import get_db_session
+
+    # Transition status from "uploading" to "processing"
+    try:
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(VideoModel).where(VideoModel.id == model_id)
+            )
+            model = result.scalar_one_or_none()
+            if model:
+                model.status = ModelStatus.PROCESSING.value
+                model.processing_stage = ProcessingStage.PREPARING.value
+                model.progress_percent = 5
+                from datetime import datetime
+                model.processing_started_at = datetime.utcnow()
+                await db.commit()
+    except Exception as e:
+        logger.error(f"Failed to update status to processing for model {model_id}: {e}")
 
     # Step 1: Process video first (required before S3 upload and avatar training)
     raw_path = local_path  # local_path is the raw file

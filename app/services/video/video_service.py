@@ -331,32 +331,103 @@ async def trim_video_to_timestamp(
         return False
 
 
-async def reverse_video(input_path: str, output_path: str) -> bool:
+async def reverse_video(input_path: str, output_path: str, chunk_seconds: int = 5, timeout: int = 300) -> bool:
     """
-    Create a reversed copy of a video using ffmpeg reverse filter.
+    Create a reversed copy of a video using chunk-based reversal.
 
-    Note: The reverse filter buffers the entire video in memory.
-    Only suitable for short videos (<=60s).
+    Splits the video into small chunks, reverses each individually, then
+    concatenates them in reverse order. This avoids buffering all frames
+    in memory (~9GB for 60s 1080p) and instead uses ~750MB per chunk.
 
     Args:
         input_path: Path to input video file
         output_path: Path for reversed output video
+        chunk_seconds: Duration of each chunk in seconds (default: 5)
+        timeout: Timeout per ffmpeg operation in seconds (default: 300)
 
     Returns:
         True if successful, False on error
     """
-    logger.info(f"Reversing video: {input_path}")
+    logger.info(f"Reversing video (chunked, {chunk_seconds}s chunks): {input_path}")
+
+    video_info = await get_video_info(input_path)
+    if video_info is None:
+        logger.error(f"Could not get video info for reverse: {input_path}")
+        return False
+
+    duration = video_info["duration"]
+    chunk_dir = None
 
     try:
+        chunk_dir = tempfile.mkdtemp(prefix="reverse_chunks_")
+
+        # Calculate chunk boundaries
+        chunks = []
+        start = 0.0
+        while start < duration:
+            end = min(start + chunk_seconds, duration)
+            chunks.append((start, end - start))
+            start = end
+
+        logger.info(f"Splitting into {len(chunks)} chunks for reversal")
+
+        # Step 1: Extract and reverse each chunk
+        reversed_chunk_paths = []
+        for i, (start_time, chunk_dur) in enumerate(chunks):
+            chunk_path = os.path.join(chunk_dir, f"chunk_{i:04d}.mp4")
+            reversed_chunk_paths.append(chunk_path)
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss", str(start_time),
+                "-i", input_path,
+                "-t", str(chunk_dur),
+                "-vf", "reverse",
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                chunk_path,
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.communicate()
+                logger.error(f"FFmpeg reverse chunk {i} timed out after {timeout}s")
+                return False
+
+            if process.returncode != 0:
+                logger.error(f"FFmpeg reverse chunk {i} failed: {stderr.decode()}")
+                return False
+
+            logger.info(f"Reversed chunk {i + 1}/{len(chunks)}")
+
+        # Step 2: Concatenate reversed chunks in REVERSE order
+        reversed_chunk_paths.reverse()
+
+        list_path = os.path.join(chunk_dir, "concat_list.txt")
+        with open(list_path, "w") as f:
+            for path in reversed_chunk_paths:
+                escaped = path.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
         cmd = [
             "ffmpeg",
             "-y",
-            "-i", input_path,
-            "-vf", "reverse",
-            "-an",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
             output_path,
         ]
 
@@ -365,17 +436,25 @@ async def reverse_video(input_path: str, output_path: str) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            logger.error(f"FFmpeg concat reversed chunks timed out after {timeout}s")
+            return False
 
         if process.returncode != 0:
-            logger.error(f"FFmpeg reverse failed: {stderr.decode()}")
+            logger.error(f"FFmpeg concat reversed chunks failed: {stderr.decode()}")
             return False
 
         if not os.path.exists(output_path):
             logger.error(f"Reversed video not created: {output_path}")
             return False
 
-        logger.info(f"Video reversed: {output_path}")
+        logger.info(f"Video reversed (chunked): {output_path}")
         return True
 
     except FileNotFoundError:
@@ -384,6 +463,12 @@ async def reverse_video(input_path: str, output_path: str) -> bool:
     except Exception as e:
         logger.error(f"Error reversing video: {e}")
         return False
+    finally:
+        if chunk_dir and os.path.exists(chunk_dir):
+            try:
+                shutil.rmtree(chunk_dir)
+            except OSError as e:
+                logger.warning(f"Failed to clean up chunk dir {chunk_dir}: {e}")
 
 
 async def concat_videos(input_paths: list[str], output_path: str) -> bool:
