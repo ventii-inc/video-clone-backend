@@ -622,9 +622,12 @@ async def process_s3_upload_background_tasks(
     Flow:
     1. Download video from S3 to local disk
     2. Process video (trim 60s, 25fps, remove audio)
-    3. Gemini end-frame analysis + reverse-append loop
+    3. Upload processed video back to S3 (overwrite source key)
     4. Create avatar job
     5. Generate thumbnail and trigger avatar processing
+
+    Note: Gemini analysis + reverse-append loop is done on the worker (RunPod)
+    to avoid OOM on EC2.
     """
     import time as time_module
     task_start = time_module.perf_counter()
@@ -709,32 +712,28 @@ async def process_s3_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 3: Gemini end-frame analysis + reverse-append loop
+    # Step 3: Upload processed video back to S3 (overwrite source key)
+    # Must complete before creating avatar job to avoid race condition
+    # where worker tries to download before upload finishes
     try:
         step_start = time_module.perf_counter()
-        logger.info(f"[DEBUG] Step 3: Gemini end-frame analysis + reverse-append loop")
-        looped_path, looped_duration = await video_service.analyze_and_loop_video(processed_path)
-        logger.info(f"[DEBUG] Step 3 DONE in {(time_module.perf_counter() - step_start):.2f}s - Video looped: {looped_path} ({looped_duration:.2f}s)")
+        logger.info(f"[DEBUG] Step 3: Uploading processed video to S3: {s3_key}")
+        upload_success = await s3_service.upload_file(processed_path, s3_key)
+        if not upload_success:
+            raise Exception("S3 upload failed")
+        logger.info(f"[DEBUG] Step 3 DONE in {(time_module.perf_counter() - step_start):.2f}s - Uploaded processed video to S3")
 
-        # Replace processed video with looped version
-        if looped_path != processed_path:
-            if os.path.exists(processed_path):
-                os.remove(processed_path)
-            os.rename(looped_path, processed_path)
-
-        # Update model with looped video info
         async with get_db_session() as db:
             result = await db.execute(
                 select(VideoModel).where(VideoModel.id == model_id)
             )
             model = result.scalar_one_or_none()
             if model:
-                model.duration_seconds = int(looped_duration)
-                model.file_size_bytes = os.path.getsize(processed_path)
+                model.progress_percent = 10
                 await db.commit()
 
     except Exception as e:
-        logger.error(f"Gemini analysis/looping failed for model {model_id}: {e}")
+        logger.error(f"S3 upload failed for model {model_id}: {e}")
         async with get_db_session() as db:
             result = await db.execute(
                 select(VideoModel).where(VideoModel.id == model_id)
@@ -742,7 +741,7 @@ async def process_s3_upload_background_tasks(
             model = result.scalar_one_or_none()
             if model:
                 model.status = ModelStatus.FAILED.value
-                model.error_message = f"Video analysis/looping failed: {str(e)}"
+                model.error_message = f"Failed to upload processed video to S3: {str(e)}"
                 await db.commit()
         return
 
@@ -832,14 +831,17 @@ async def process_upload_background_tasks(
     s3_key: str,
 ):
     """
-    Background task to process video, create avatar job, upload to S3, generate thumbnail,
+    Background task to process video, upload to S3, create avatar job, generate thumbnail,
     and trigger avatar processing.
 
     Flow:
     1. Process video (trim 60s, 25fps, remove audio)
-    2. Gemini end-frame analysis + reverse-append loop
-    3. Create avatar job (AFTER video is processed to avoid race condition)
-    4. In parallel: upload to S3, generate thumbnail, trigger avatar processing
+    2. Upload processed video to S3 (sequential, before job creation)
+    3. Create avatar job (AFTER upload to avoid race condition with worker)
+    4. In parallel: generate thumbnail, trigger avatar processing
+
+    Note: Gemini analysis + reverse-append loop is done on the worker (RunPod)
+    to avoid OOM on EC2.
     """
     from app.db import get_db_session
 
@@ -898,30 +900,26 @@ async def process_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 2: Gemini end-frame analysis + reverse-append loop
+    # Step 2: Upload processed video to S3
+    # Must complete before creating avatar job to avoid race condition
+    # where worker tries to download before upload finishes
     try:
-        looped_path, looped_duration = await video_service.analyze_and_loop_video(processed_path)
-        logger.info(f"Video looped: {looped_path} ({looped_duration:.2f}s)")
+        upload_success = await s3_service.upload_file(processed_path, s3_key)
+        if not upload_success:
+            raise Exception("S3 upload failed")
+        logger.info(f"S3 upload complete: {s3_key}")
 
-        # Replace processed video with looped version
-        if looped_path != processed_path:
-            if os.path.exists(processed_path):
-                os.remove(processed_path)
-            os.rename(looped_path, processed_path)
-
-        # Update model with looped video info
         async with get_db_session() as db:
             result = await db.execute(
                 select(VideoModel).where(VideoModel.id == model_id)
             )
             model = result.scalar_one_or_none()
             if model:
-                model.duration_seconds = int(looped_duration)
-                model.file_size_bytes = os.path.getsize(processed_path)
+                model.progress_percent = 10
                 await db.commit()
 
     except Exception as e:
-        logger.error(f"Gemini analysis/looping failed for model {model_id}: {e}")
+        logger.error(f"S3 upload failed for model {model_id}: {e}")
         async with get_db_session() as db:
             result = await db.execute(
                 select(VideoModel).where(VideoModel.id == model_id)
@@ -929,11 +927,11 @@ async def process_upload_background_tasks(
             model = result.scalar_one_or_none()
             if model:
                 model.status = ModelStatus.FAILED.value
-                model.error_message = f"Video analysis/looping failed: {str(e)}"
+                model.error_message = f"Failed to upload processed video to S3: {str(e)}"
                 await db.commit()
         return
 
-    # Step 3: Create avatar job NOW (after video is processed)
+    # Step 3: Create avatar job NOW (after upload to avoid race condition with worker)
     # This prevents race condition where scheduler picks up job before video processing completes
     try:
         async with get_db_session() as db:
@@ -956,26 +954,7 @@ async def process_upload_background_tasks(
                 await db.commit()
         return
 
-    # Step 4: Run S3 upload, thumbnail generation, and avatar processing in parallel
-    async def upload_to_s3():
-        """Upload the processed video file to S3."""
-        try:
-            success = await s3_service.upload_file(processed_path, s3_key)
-            if success:
-                logger.info(f"S3 upload complete: {s3_key}")
-                async with get_db_session() as db:
-                    result = await db.execute(
-                        select(VideoModel).where(VideoModel.id == model_id)
-                    )
-                    model = result.scalar_one_or_none()
-                    if model:
-                        model.progress_percent = 10  # S3 upload done
-                        await db.commit()
-            else:
-                logger.error(f"S3 upload failed: {s3_key}")
-        except Exception as e:
-            logger.error(f"S3 upload error for model {model_id}: {e}")
-
+    # Step 4: Generate thumbnail and trigger avatar processing in parallel
     async def generate_and_upload_thumbnail():
         """Extract thumbnail from processed video and upload to S3."""
         try:
@@ -1022,9 +1001,8 @@ async def process_upload_background_tasks(
         except Exception as e:
             logger.error(f"Avatar processing trigger error for model {model_id}: {e}")
 
-    task_names = ["upload_to_s3", "generate_thumbnail", "trigger_avatar_processing"]
+    task_names = ["generate_thumbnail", "trigger_avatar_processing"]
     results = await asyncio.gather(
-        upload_to_s3(),
         generate_and_upload_thumbnail(),
         trigger_avatar_processing(),
         return_exceptions=True,

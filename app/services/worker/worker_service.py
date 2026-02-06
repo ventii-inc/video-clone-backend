@@ -94,6 +94,7 @@ class WorkerService:
         start_time = time.time()
         avatar_id = str(video_model_id)
         video_path = None
+        looped_path = None
 
         # Check if we can accept the job
         if not await self._increment_jobs():
@@ -130,8 +131,25 @@ class WorkerService:
             await api_callback_client.send_progress(
                 job_id=job_id,
                 stage="preparing",
+                progress_percent=10,
+                message="Analyzing video and creating loop",
+            )
+
+            # Analyze and loop video (Gemini end-frame detection + reverse-append)
+            from app.services.video import video_service
+            looped_path, looped_duration = await video_service.analyze_and_loop_video(video_path)
+            logger.info(
+                f"Avatar job {job_id}: video looped - {looped_path} ({looped_duration:.2f}s)"
+            )
+
+            # Use looped video for avatar training
+            training_video_path = looped_path
+
+            await api_callback_client.send_progress(
+                job_id=job_id,
+                stage="preparing",
                 progress_percent=15,
-                message="Video downloaded, starting avatar generation",
+                message="Video looped, starting avatar generation",
             )
 
             # Execute avatar generation via CLI
@@ -143,7 +161,7 @@ class WorkerService:
             )
 
             result = await livetalking_cli_service.generate_avatar(
-                video_path=video_path,
+                video_path=training_video_path,
                 avatar_id=avatar_id,
                 user_id=user_id,
                 img_size=img_size,
@@ -215,12 +233,13 @@ class WorkerService:
             }
 
         finally:
-            # Clean up temp video file
-            if video_path and os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                except Exception as e:
-                    logger.warning(f"Failed to clean up temp video: {e}")
+            # Clean up temp video files
+            for path in [video_path, looped_path]:
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up temp file {path}: {e}")
 
             await self._decrement_jobs()
 

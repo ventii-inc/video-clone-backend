@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from typing import Optional
 
@@ -14,6 +15,32 @@ MAX_TRAINING_VIDEO_DURATION = 60
 
 # Target FPS for training videos
 TARGET_TRAINING_FPS = 25
+
+# Cached GPU availability (None = not checked yet)
+_gpu_available: Optional[bool] = None
+
+
+def _has_nvidia_gpu() -> bool:
+    """Check if NVIDIA GPU is available for hardware-accelerated encoding."""
+    global _gpu_available
+    if _gpu_available is not None:
+        return _gpu_available
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], capture_output=True, timeout=5
+        )
+        _gpu_available = result.returncode == 0
+    except Exception:
+        _gpu_available = False
+    logger.info(f"NVIDIA GPU available: {_gpu_available}")
+    return _gpu_available
+
+
+def _get_encoder_args() -> list[str]:
+    """Return ffmpeg encoder args: h264_nvenc on GPU, libx264 on CPU."""
+    if _has_nvidia_gpu():
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", "23"]
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
 
 
 async def get_video_info(file_path: str) -> Optional[dict]:
@@ -293,14 +320,13 @@ async def trim_video_to_timestamp(
     logger.info(f"Trimming video to {end_seconds:.2f}s: {input_path}")
 
     try:
+        encoder_args = _get_encoder_args()
         cmd = [
             "ffmpeg",
             "-y",
             "-i", input_path,
             "-t", str(end_seconds),
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
+            *encoder_args,
             "-an",
             output_path,
         ]
@@ -380,6 +406,7 @@ async def reverse_video(input_path: str, output_path: str, chunk_seconds: int = 
         logger.info(f"Splitting into {len(chunks)} chunks for reversal")
 
         # Step 1: Extract and reverse each chunk
+        encoder_args = _get_encoder_args()
         reversed_chunk_paths = []
         for i, (start_time, chunk_dur) in enumerate(chunks):
             chunk_path = os.path.join(chunk_dir, f"chunk_{i:04d}.mp4")
@@ -393,9 +420,7 @@ async def reverse_video(input_path: str, output_path: str, chunk_seconds: int = 
                 "-t", str(chunk_dur),
                 "-vf", "reverse",
                 "-an",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
+                *encoder_args,
                 chunk_path,
             ]
 
