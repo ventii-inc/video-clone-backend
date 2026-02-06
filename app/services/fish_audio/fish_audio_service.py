@@ -271,7 +271,6 @@ class FishAudioService:
                     # TTS generation parameters for deterministic output
                     "temperature": self.settings.FISH_AUDIO_TEMPERATURE,
                     "top_p": self.settings.FISH_AUDIO_TOP_P,
-                    "chunk_length": self.settings.FISH_AUDIO_CHUNK_LENGTH,
                     "speed": self.settings.FISH_AUDIO_SPEED,
                     "volume": self.settings.FISH_AUDIO_VOLUME,
                     "normalize": self.settings.FISH_AUDIO_NORMALIZE,
