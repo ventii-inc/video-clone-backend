@@ -42,11 +42,17 @@ def load_env_keys() -> tuple[str, str]:
     return fish_key, gemini_key
 
 
-def call_fish_audio(text: str, reference_id: str, api_key: str, chunk_length: int | None = None) -> bytes:
+def call_fish_audio(
+    text: str,
+    reference_id: str,
+    api_key: str,
+    chunk_length: int | None = None,
+    repetition_penalty: float | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+) -> bytes:
     payload = {
         "text": text,
-        "temperature": 0.01,
-        "top_p": 0.01,
         "reference_id": reference_id,
         "prosody": {"volume": 0},
         "normalize": True,
@@ -56,6 +62,12 @@ def call_fish_audio(text: str, reference_id: str, api_key: str, chunk_length: in
     }
     if chunk_length is not None:
         payload["chunk_length"] = chunk_length
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = repetition_penalty
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if top_p is not None:
+        payload["top_p"] = top_p
 
     with httpx.Client(timeout=120.0) as client:
         response = client.post(
@@ -66,7 +78,9 @@ def call_fish_audio(text: str, reference_id: str, api_key: str, chunk_length: in
             },
             json=payload,
         )
-        response.raise_for_status()
+        if response.status_code != 200:
+            print(f"Fish Audio error {response.status_code}: {response.text}")
+            sys.exit(1)
         return response.content
 
 
@@ -97,9 +111,15 @@ def detect_repetition(original: str, transcript: str, client: genai.Client) -> t
         contents=[
             f"Original text:\n{original}\n\n"
             f"Transcript:\n{transcript}\n\n"
-            "Compare the original text with the transcript. "
-            "Are there any phrases in the transcript that are repeated "
-            "(appear more times in the transcript than in the original)? "
+            "Check if the transcript contains any CONSECUTIVE phrase repetition — "
+            "a phrase of 5+ characters that appears back-to-back (the same phrase spoken twice in a row). "
+            "Do NOT flag single words, short fragments, or words that naturally appear multiple times in different parts of the text. "
+            "\n\n"
+            "Example of REAL repetition (flag this):\n"
+            "  '自分の動画と音声をAIに学習させて自分の動画と音声をAIに学習させて' — same phrase twice in a row\n"
+            "Example of NOT repetition (do NOT flag):\n"
+            "  '動画' appearing in '説明動画' and 'ショート動画' — same word in different contexts\n"
+            "\n"
             "Respond with ONLY a JSON object, no markdown, no explanation:\n"
             '{"has_repetition": true/false, "repeated_phrases": ["phrase1", ...]}'
         ],
@@ -123,6 +143,9 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="Number of test runs")
     parser.add_argument("--text", type=str, default=DEFAULT_TEXT, help="Text to synthesize")
     parser.add_argument("--reference-id", type=str, required=True, help="Fish Audio voice reference ID")
+    parser.add_argument("--repetition-penalty", type=float, default=None, help="Repetition penalty (Fish Audio default: 1.2, try 1.5 or 2.0)")
+    parser.add_argument("--temperature", type=float, default=None, help="Sampling temperature (omit to use Fish Audio default)")
+    parser.add_argument("--top-p", type=float, default=None, help="Top-p sampling (omit to use Fish Audio default)")
     parser.add_argument("--save-audio", action="store_true", help="Save audio files to current directory")
     args = parser.parse_args()
 
@@ -136,8 +159,11 @@ def main():
 
     gemini_client = genai.Client(api_key=gemini_api_key)
     chunk_label = f"chunk_length={args.chunk_length}" if args.chunk_length else "no chunk_length (default)"
+    penalty_label = f"repetition_penalty={args.repetition_penalty}" if args.repetition_penalty else "no repetition_penalty (default 1.2)"
+    temp_label = f"temperature={args.temperature}" if args.temperature is not None else "no temperature (default)"
+    top_p_label = f"top_p={args.top_p}" if args.top_p is not None else "no top_p (default)"
 
-    print(f"Config: {chunk_label}, runs={args.runs}")
+    print(f"Config: {chunk_label}, {penalty_label}, {temp_label}, {top_p_label}, runs={args.runs}")
     print(f"Text length: {len(args.text)} chars")
     print(f"Reference ID: {args.reference_id}")
     print()
@@ -150,7 +176,15 @@ def main():
         print(f"\n--- Run {i + 1}/{args.runs} ({chunk_label}) ---")
 
         print("Generating TTS...")
-        audio = call_fish_audio(args.text, args.reference_id, fish_api_key, args.chunk_length)
+        audio = call_fish_audio(
+            args.text,
+            args.reference_id,
+            fish_api_key,
+            args.chunk_length,
+            args.repetition_penalty,
+            args.temperature,
+            args.top_p,
+        )
         print(f"Audio size: {len(audio):,} bytes")
 
         if args.save_audio:
@@ -178,7 +212,7 @@ def main():
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Config: {chunk_label}")
+    print(f"Config: {chunk_label}, {penalty_label}, {temp_label}, {top_p_label}")
     total = len(results)
     bad = sum(results)
     good = total - bad
