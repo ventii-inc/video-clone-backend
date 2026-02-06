@@ -193,9 +193,11 @@ class AvatarJobService:
             "cli", "api", "remote", or "worker"
         """
         # Check if worker service is configured (highest priority)
+        logger.info(f"[DEBUG] _get_execution_mode: worker_client.is_enabled={worker_client.is_enabled}, worker_url={worker_client.worker_url}")
         if worker_client.is_enabled:
             # Verify worker is reachable and has capacity
             is_healthy = await worker_client.health_check()
+            logger.info(f"[DEBUG] _get_execution_mode: worker health_check={is_healthy}")
             if is_healthy:
                 logger.info("Worker service enabled and healthy, using worker mode")
                 return "worker"

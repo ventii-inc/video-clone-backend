@@ -322,16 +322,21 @@ class WorkerClient:
             True if worker is healthy, False otherwise
         """
         if not self.worker_url:
+            logger.warning("[DEBUG] health_check: no worker_url configured")
             return False
 
         try:
+            url = f"{self.worker_url}/api/v1/worker/health"
+            logger.info(f"[DEBUG] health_check: checking {url}")
             async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(f"{self.worker_url}/api/v1/worker/health")
+                response = await client.get(url)
+                logger.info(f"[DEBUG] health_check: status={response.status_code}, body={response.text[:200]}")
                 if response.status_code == 200:
                     data = response.json()
                     return data.get("status") in ("healthy", "degraded")
                 return False
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[DEBUG] health_check failed: {e}")
             return False
 
 
