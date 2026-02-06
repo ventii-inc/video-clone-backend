@@ -400,6 +400,7 @@ async def init_upload(
 
     This bypasses the slow RunPod network by having clients upload directly to S3.
     """
+    logger.info(f"[DEBUG] /upload/init - START - user_id={user.id}, name={data.name}")
     total_start = time.perf_counter()
     timings = {}
 
@@ -491,6 +492,7 @@ async def init_upload(
         f"TOTAL={timings['total']:.1f}ms"
     )
 
+    logger.info(f"[DEBUG] /upload/init - DONE - Returning response for model_id={model.id}")
     return UploadInitResponse(
         model_id=model.id,
         upload_url=upload_url,
@@ -516,6 +518,7 @@ async def complete_upload(
 
     The video is downloaded from S3 to local disk for processing.
     """
+    logger.info(f"[DEBUG] /upload/complete - START - user_id={user.id}, model_id={data.model_id}")
     total_start = time.perf_counter()
     timings = {}
 
@@ -590,6 +593,7 @@ async def complete_upload(
     ext = os.path.splitext(model.source_video_key)[1] or ".mp4"
     local_path = os.path.join(settings.VIDEO_LOCAL_PATH, f"{model.id}_raw{ext}")
 
+    logger.info(f"[DEBUG] /upload/complete - Adding background task for model_id={model.id}")
     background_tasks.add_task(
         process_s3_upload_background_tasks,
         model_id=model.id,
@@ -598,6 +602,7 @@ async def complete_upload(
         local_path=local_path,
     )
 
+    logger.info(f"[DEBUG] /upload/complete - DONE - Returning response for model_id={model.id}")
     return DirectUploadResponse(
         model=VideoModelBrief.model_validate(model),
         job_id=None,  # Job created in background after video processing
@@ -621,15 +626,20 @@ async def process_s3_upload_background_tasks(
     4. Create avatar job
     5. Generate thumbnail and trigger avatar processing
     """
+    import time as time_module
+    task_start = time_module.perf_counter()
+    logger.info(f"[DEBUG] BACKGROUND TASK START - model_id={model_id}, s3_key={s3_key}")
+
     from app.db import get_db_session
 
     # Step 1: Download from S3
     try:
-        logger.info(f"Downloading video from S3: {s3_key}")
+        step_start = time_module.perf_counter()
+        logger.info(f"[DEBUG] Step 1: Downloading video from S3: {s3_key}")
         success = await s3_service.download_file(s3_key, local_path)
         if not success:
             raise Exception("S3 download failed")
-        logger.info(f"Downloaded video to: {local_path}")
+        logger.info(f"[DEBUG] Step 1 DONE in {(time_module.perf_counter() - step_start):.2f}s - Downloaded video to: {local_path}")
     except Exception as e:
         logger.error(f"Failed to download video from S3 for model {model_id}: {e}")
         async with get_db_session() as db:
@@ -648,8 +658,10 @@ async def process_s3_upload_background_tasks(
     processed_path = local_path.replace("_raw", "")
 
     try:
+        step_start = time_module.perf_counter()
+        logger.info(f"[DEBUG] Step 2: Processing video (trim, fps, audio removal)")
         _, processed_duration, _ = await video_service.process_training_video(raw_path, processed_path)
-        logger.info(f"Processed video: {processed_path} (duration: {processed_duration:.2f}s)")
+        logger.info(f"[DEBUG] Step 2 DONE in {(time_module.perf_counter() - step_start):.2f}s - Processed video: {processed_path} (duration: {processed_duration:.2f}s)")
 
         # Update model with processed info
         async with get_db_session() as db:
@@ -682,8 +694,10 @@ async def process_s3_upload_background_tasks(
 
     # Step 3: Gemini end-frame analysis + reverse-append loop
     try:
+        step_start = time_module.perf_counter()
+        logger.info(f"[DEBUG] Step 3: Gemini end-frame analysis + reverse-append loop")
         looped_path, looped_duration = await video_service.analyze_and_loop_video(processed_path)
-        logger.info(f"Video looped: {looped_path} ({looped_duration:.2f}s)")
+        logger.info(f"[DEBUG] Step 3 DONE in {(time_module.perf_counter() - step_start):.2f}s - Video looped: {looped_path} ({looped_duration:.2f}s)")
 
         # Replace processed video with looped version
         if looped_path != processed_path:
@@ -717,13 +731,15 @@ async def process_s3_upload_background_tasks(
 
     # Step 4: Create avatar job
     try:
+        step_start = time_module.perf_counter()
+        logger.info(f"[DEBUG] Step 4: Creating avatar job")
         async with get_db_session() as db:
             job = await avatar_job_service.create_job(
                 video_model_id=model_id,
                 user_id=user_id,
                 db=db,
             )
-            logger.info(f"Created avatar job {job.id} for video model {model_id}")
+            logger.info(f"[DEBUG] Step 4 DONE in {(time_module.perf_counter() - step_start):.2f}s - Created avatar job {job.id} for video model {model_id}")
     except Exception as e:
         logger.error(f"Failed to create avatar job for model {model_id}: {e}")
         async with get_db_session() as db:

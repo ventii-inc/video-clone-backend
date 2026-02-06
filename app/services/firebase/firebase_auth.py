@@ -77,11 +77,18 @@ async def verify_token_async(id_token: str) -> TokenData:
     Raises:
         HTTPException: If token verification fails
     """
+    import time
+    start = time.perf_counter()
+    logger.debug(f"[DEBUG] verify_token_async - START")
+
     # Ensure Firebase is initialized
     get_firebase_app()
+    logger.debug(f"[DEBUG] verify_token_async - Firebase app initialized in {(time.perf_counter() - start)*1000:.1f}ms")
 
     try:
+        t0 = time.perf_counter()
         decoded_token = await asyncio.to_thread(auth.verify_id_token, id_token)
+        logger.debug(f"[DEBUG] verify_token_async - Token verified in {(time.perf_counter() - t0)*1000:.1f}ms")
 
         return TokenData(
             uid=decoded_token["uid"],
