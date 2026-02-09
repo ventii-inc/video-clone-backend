@@ -11,6 +11,7 @@ from app.services.firebase.firebase_auth import (
     get_current_user_or_create,
     get_optional_user,
     verify_token,
+    verify_token_async,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "get_current_user_or_create",
     "get_optional_user",
     "verify_token",
+    "verify_token_async",
 ]

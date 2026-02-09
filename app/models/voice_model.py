@@ -17,11 +17,18 @@ class ModelStatus(str, PyEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    INCOMPLETE = "incomplete"
 
 
 class SourceType(str, PyEnum):
     UPLOAD = "upload"
     RECORDING = "recording"
+
+
+class Visibility(str, PyEnum):
+    PRIVATE = "private"
+    PUBLIC = "public"
+    UNLIST = "unlist"
 
 
 class VoiceModel(Base):
@@ -34,11 +41,12 @@ class VoiceModel(Base):
     name = Column(String(100), nullable=False)
     source_audio_url = Column(String(500), nullable=True)
     source_audio_key = Column(String(500), nullable=True)  # S3 key
-    model_data_url = Column(String(500), nullable=True)  # Processed model from AI
+    reference_id = Column(String(500), nullable=True)  # Fish Audio model ID
     source_type = Column(String(20), default=SourceType.UPLOAD.value, nullable=False)
     duration_seconds = Column(Integer, nullable=True)
     file_size_bytes = Column(Integer, nullable=True)
     status = Column(String(20), default=ModelStatus.PENDING.value, nullable=False, index=True)
+    visibility = Column(String(20), default=Visibility.PRIVATE.value, nullable=False)
     error_message = Column(Text, nullable=True)
     processing_started_at = Column(DateTime, nullable=True)
     processing_completed_at = Column(DateTime, nullable=True)

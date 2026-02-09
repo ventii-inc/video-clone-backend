@@ -1,6 +1,5 @@
 """S3 service for uploading and managing media files"""
 
-import logging
 import os
 from typing import Optional
 
@@ -9,8 +8,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from app.services.s3.s3_config import S3Settings
-
-logger = logging.getLogger(__name__)
+from app.utils.logger import logger
 
 
 class S3Service:
@@ -194,7 +192,7 @@ class S3Service:
             raise
 
     async def generate_presigned_url(
-        self, s3_key: str, expiration: Optional[int] = None
+        self, s3_key: str, expiration: Optional[int] = None, content_disposition: Optional[str] = None
     ) -> Optional[str]:
         """
         Generate a pre-signed URL for accessing a file from S3
@@ -202,6 +200,7 @@ class S3Service:
         Args:
             s3_key: S3 key of the file
             expiration: URL expiration time in seconds (uses default if not provided)
+            content_disposition: Optional Content-Disposition header (e.g., 'attachment; filename="video.mp4"')
 
         Returns:
             Pre-signed URL string, or None if generation fails
@@ -212,9 +211,12 @@ class S3Service:
         try:
             session, config = self._get_session()
             async with session.client("s3", config=config) as s3_client:
+                params = {"Bucket": self.bucket_name, "Key": s3_key}
+                if content_disposition:
+                    params["ResponseContentDisposition"] = content_disposition
                 url = await s3_client.generate_presigned_url(
                     "get_object",
-                    Params={"Bucket": self.bucket_name, "Key": s3_key},
+                    Params=params,
                     ExpiresIn=expiration,
                 )
 

@@ -39,8 +39,34 @@ Required environment variables:
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` - PostgreSQL connection
 - `S3_AWS_REGION`, `S3_AWS_ACCESS_KEY_ID`, `S3_AWS_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` - AWS S3 configuration
 - `FIREBASE_CREDENTIALS_FILE` - Path to Firebase service account JSON file
-- `SENTRY_DSN` (optional) - Sentry error tracking (disabled in debug mode)
-- `CORS_ORIGINS` (optional) - Comma-separated list of additional CORS origins
+
+Optional environment variables:
+- `SENTRY_DSN` - Sentry error tracking (disabled in debug mode)
+- `CORS_ORIGINS` - Comma-separated list of additional CORS origins
+- `UPLOAD_MODE` - Video upload mode: `direct_s3` (default) or `server`. Direct S3 bypasses slow RunPod network.
+- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STANDARD`, `STRIPE_PRICE_MINUTES` - Stripe billing
+- `FISH_AUDIO_API_KEY` - Fish Audio voice cloning and TTS
+- `LIVETALKING_ROOT`, `LIVETALKING_VENV`, `LIVETALKING_MODE` - LiveTalking avatar generation (cli/api/auto)
+- `AVATAR_API_KEY` - API key for backend-to-backend avatar endpoints
+- `AVATAR_MAX_CONCURRENT` - Max concurrent avatar generation jobs (default: 3)
+- `AVATAR_JOB_CHECK_INTERVAL` - Interval in seconds for background job status checks (default: 10)
+- `LIPSYNC_ENABLED` - Enable remote LipSync service mode (true/false)
+- `LIPSYNC_SERVICE_URL` - URL of the remote Lip-Sync-Experiment service
+- `LIPSYNC_API_KEY` - API key for authenticating with LipSync service
+- `LIPSYNC_TIMEOUT` - Request timeout in seconds (default: 30)
+- `BACKEND_PUBLIC_URL` - Public URL of this backend for callbacks (required for remote/worker mode)
+- `GEMINI_API_KEY` - Google Gemini API key for video end-frame analysis (required for video processing)
+- `GEMINI_MODEL` - Gemini model to use (default: `gemini-2.5-flash`)
+- `GEMINI_TIMEOUT` - Gemini API request timeout in seconds (default: 60)
+- `GEMINI_FILE_PROCESSING_TIMEOUT` - Timeout for Gemini file upload processing in seconds (default: 120)
+- `GEMINI_FILE_POLL_INTERVAL` - Poll interval when waiting for Gemini file processing in seconds (default: 3)
+
+**Dual-Mode Backend (API ↔ Worker):**
+- `BACKEND_MODE` - Deployment mode: `api` (default, full app) or `worker` (minimal, CLI-focused)
+- `WORKER_SERVICE_URL` - URL of the worker service (API mode, for submitting jobs)
+- `WORKER_API_KEY` - Shared secret for API ↔ Worker authentication
+- `API_SERVER_URL` - URL of the API server (Worker mode, for callbacks)
+- `API_SERVER_API_KEY` - API key for worker → API callbacks
 
 ## Architecture
 
@@ -49,15 +75,43 @@ Required environment variables:
 **API Pattern:**
 - All API routes are prefixed with `/api/v1` (defined in `app/utils/constants.py`)
 - Routers use tags for OpenAPI grouping
-- Authentication via Firebase token in `Authorization: Bearer <token>` header
+- User authentication: Firebase token in `Authorization: Bearer <token>` header
+- Backend-to-backend auth: API key in `X-API-Key` header (see `app/services/api_key/`)
 
 **Key Modules:**
-- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings)
-- `app/models/` - SQLAlchemy models (User, UserProfile, VideoModel, VoiceModel, GeneratedVideo, Subscription, etc.)
+- `app/routers/` - API endpoints (auth, users, video_models, voice_models, generate, videos, dashboard, billing, settings, avatar, avatar_backend, worker)
+- `app/models/` - SQLAlchemy models (User, UserProfile, VideoModel, VoiceModel, GeneratedVideo, Subscription, AvatarJob, etc.)
 - `app/schemas/` - Pydantic request/response schemas
-- `app/services/` - Business logic (firebase, s3, ai, usage_service)
+- `app/services/` - Business logic services (see Service Layer below)
 - `app/utils/` - Helpers (logger, constants, response_utils, sentry_utils)
 - `app/middleware/` - Performance monitoring middleware
+
+**Service Layer:**
+- `firebase/` - Firebase auth, token verification, user dependencies
+- `s3/` - S3 file uploads, downloads, presigned URLs
+- `stripe/` - Stripe payments, subscriptions, webhooks
+- `fish_audio/` - Voice cloning and TTS via Fish Audio API
+- `gemini/` - Gemini AI video analysis for end-frame detection and loop creation
+- `livetalking/` - Avatar generation via CLI subprocess or RunPod API
+- `lipsync_client/` - Client for remote Lip-Sync-Experiment service
+- `worker/` - Dual-mode worker client/service (API ↔ Worker communication)
+- `avatar_job/` - Avatar generation job queue with concurrency control
+- `scheduler/` - Background task scheduler for periodic job status checks
+- `video/` - Video generation orchestration
+- `audio/` - Audio processing utilities
+- `progress/` - Progress tracking for long-running operations
+- `usage_service.py` - Credit/minutes tracking per billing period
+
+**Avatar Generation Pipeline:**
+1. User uploads video → `VideoModel` created with `status=PENDING`
+2. `AvatarJob` queued → job processor checks concurrent slots
+3. Execution mode chosen (priority order):
+   - `worker` - If `WORKER_SERVICE_URL` configured, jobs sent to remote worker (RunPod)
+   - `remote` - If `LIPSYNC_ENABLED=true`, jobs sent to external Lip-Sync-Experiment service
+   - `cli` - Local subprocess execution (default)
+   - `api` - RunPod API (if GPU available)
+4. Progress tracked via `ProcessingStage` enum (PENDING → PREPARING → TRAINING → FINALIZING → COMPLETED)
+5. Result uploaded to S3 as `.tar` archive → email notification sent
 
 **Database Session Patterns:**
 - `get_db()` - Async FastAPI dependency for route injection (use with `Depends(get_db)`)
@@ -86,7 +140,7 @@ return error_response("CUSTOM_ERROR", "Something went wrong", status_code=400)
 **Firebase Auth Usage:**
 ```python
 from fastapi import Depends
-from app.services.firebase import get_current_user, get_current_user_or_create
+from app.services.firebase import get_current_user, get_current_user_or_create, get_optional_user
 from app.models import User
 
 # Protected route - requires existing user
@@ -98,6 +152,22 @@ async def get_profile(user: User = Depends(get_current_user)):
 @router.post("/login")
 async def login(user: User = Depends(get_current_user_or_create)):
     return {"message": "Welcome", "user_id": user.id}
+
+# Optional auth - returns None if not authenticated
+@router.get("/public")
+async def public_route(user: User | None = Depends(get_optional_user)):
+    return {"authenticated": user is not None}
+```
+
+**API Key Auth (Backend-to-Backend):**
+```python
+from fastapi import Depends
+from app.services.api_key import get_api_key
+
+@router.post("/internal/callback")
+async def internal_callback(api_key: str = Depends(get_api_key)):
+    # Protected by X-API-Key header
+    pass
 ```
 
 **S3 Service Usage:**
@@ -106,6 +176,7 @@ from app.services.s3 import s3_service
 
 await s3_service.upload_file("/path/to/file.mp4", "videos/user123/video.mp4")
 await s3_service.upload_fileobj(file.file, "videos/user123/video.mp4", content_type="video/mp4")
+await s3_service.download_file("videos/user123/video.mp4", "/local/path.mp4")
 url = await s3_service.generate_presigned_url("videos/user123/video.mp4")
 upload_url = await s3_service.generate_presigned_upload_url("videos/user123/video.mp4", content_type="video/mp4")
 exists = await s3_service.file_exists("videos/user123/video.mp4")
@@ -113,8 +184,64 @@ await s3_service.delete_file("videos/user123/video.mp4")
 s3_key = s3_service.generate_s3_key("user123", "video.mp4", media_type="videos")
 ```
 
-**AI Service:**
-The `app/services/ai/ai_service.py` contains a mock implementation for video/voice model processing and video generation. Replace with actual AI API integrations in production.
+**Fish Audio Service (Voice Cloning & TTS):**
+```python
+from app.services.fish_audio import fish_audio_service
+
+# Clone voice from audio bytes
+result = await fish_audio_service.clone_voice(audio_data, "Voice Name", visibility="private")
+if result.success:
+    model_id = result.model_id
+
+# Generate speech from cloned voice
+tts_result = await fish_audio_service.text_to_speech("Hello world", reference_id=model_id)
+if tts_result.success:
+    audio_path = tts_result.audio_path
+```
+
+**Avatar Job Service:**
+```python
+from app.services.avatar_job import avatar_job_service
+
+# Create and queue a job
+job = await avatar_job_service.create_job(video_model_id, user_id, db)
+
+# Process pending jobs (respects AVATAR_MAX_CONCURRENT)
+jobs_started = await avatar_job_service.process_pending_jobs(db)
+
+# Retry a failed job
+job = await avatar_job_service.retry_job(job_id, db)
+```
+
+**Direct S3 Upload (for slow network environments like RunPod):**
+
+When `UPLOAD_MODE=direct_s3` (default), clients upload directly to S3 to bypass slow server network:
+
+```
+# Step 1: Get presigned upload URL
+POST /api/v1/models/video/upload/init
+{
+  "name": "My Avatar",
+  "content_type": "video/mp4"
+}
+# Returns: { "model_id": "...", "upload_url": "https://s3...", "s3_key": "...", "expires_in": 300 }
+
+# Step 2: Client uploads directly to S3 using the presigned URL
+PUT {upload_url}
+Content-Type: video/mp4
+<binary video data>
+
+# Step 3: Notify server to start processing
+POST /api/v1/models/video/upload/complete
+{
+  "model_id": "...",
+  "duration_seconds": 30,
+  "file_size_bytes": 3500000
+}
+# Returns: { "model": {...}, "message": "Upload complete, processing started" }
+```
+
+When `UPLOAD_MODE=server`, clients use the legacy `/upload` endpoint that uploads through the server.
 
 **Firebase Setup:**
 1. Download service account JSON from Firebase Console
@@ -136,3 +263,90 @@ aws rds describe-db-clusters --region ap-northeast-1 --db-cluster-identifier vid
 ```
 
 Note: Aurora automatically restarts stopped clusters after 7 days.
+
+## Dual-Mode Backend (API ↔ Worker)
+
+The backend supports two deployment modes via `BACKEND_MODE`:
+
+**API Mode (EC2):** `BACKEND_MODE=api` (default)
+- Full application with all user-facing endpoints
+- Firebase authentication, Stripe billing, dashboard
+- Job orchestration: creates jobs and submits to worker
+- Receives callbacks from worker with progress/completion
+
+**Worker Mode (RunPod):** `BACKEND_MODE=worker`
+- Minimal application with only worker endpoints
+- No Firebase, no user auth (uses API key auth)
+- Executes avatar/video generation via CLI (genavatar.py, benchmark_e2e.py)
+- Downloads videos from S3, uploads results, sends callbacks to API
+
+**Architecture:**
+```
+EC2 (BACKEND_MODE=api)              RunPod (BACKEND_MODE=worker)
+┌─────────────────────┐             ┌─────────────────────┐
+│ User Auth, Billing  │             │ CLI Execution       │
+│ Dashboard, Generate │ ──jobs───▶  │ genavatar.py        │
+│                     │             │ benchmark_e2e.py    │
+│ Callback Endpoints  │ ◀─progress─ │                     │
+│ Job Orchestration   │ ◀─complete─ │ S3 Upload/Download  │
+└─────────────────────┘             └─────────────────────┘
+```
+
+**Worker Endpoints:**
+```
+POST /api/v1/worker/jobs/avatar   # Execute avatar generation
+POST /api/v1/worker/jobs/video    # Execute video generation
+GET  /api/v1/worker/health        # Health + GPU info
+GET  /api/v1/worker/capacity      # Available processing slots
+```
+
+**Running Locally:**
+```bash
+# Terminal 1: Worker
+BACKEND_MODE=worker WORKER_API_KEY=test-key API_SERVER_URL=http://localhost:8000 API_SERVER_API_KEY=test-key \
+  uv run uvicorn main:app --port 8001
+
+# Terminal 2: API
+BACKEND_MODE=api WORKER_SERVICE_URL=http://localhost:8001 WORKER_API_KEY=test-key AVATAR_API_KEY=test-key \
+  uv run uvicorn main:app --port 8000
+```
+
+**Worker Client Usage (API server submitting jobs):**
+```python
+from app.services.worker import worker_client
+
+# Submit avatar job to worker
+response = await worker_client.submit_avatar_job(
+    job_id=job.id,
+    video_model_id=video_model.id,
+    user_id=user.id,
+    video_url=presigned_url,
+    callback_url=f"{backend_url}/api/v1/internal/avatar/jobs/{job.id}/callback",
+)
+
+# Check worker capacity
+capacity = await worker_client.check_capacity()
+print(f"Available slots: {capacity.available_slots}")
+```
+
+**API Callback Client Usage (Worker sending callbacks):**
+```python
+from app.services.worker import api_callback_client
+
+# Send progress update
+await api_callback_client.send_progress(
+    job_id=job_id,
+    stage="training",
+    progress_percent=50,
+    message="Processing frames",
+)
+
+# Send completion
+await api_callback_client.send_completion(
+    job_id=job_id,
+    status="completed",
+    s3_key="avatars/123/avatar-id.tar",
+    frame_count=1800,
+    processing_time_seconds=120.5,
+)
+```

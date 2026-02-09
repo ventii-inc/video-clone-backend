@@ -40,10 +40,21 @@ class PerformanceMiddleware(BaseHTTPMiddleware):
         Returns:
             Response with timing header
         """
+        path = request.url.path
+        method = request.method
+
+        # Log incoming request for debugging hangs
+        if "/upload" in path or "/models/video" in path:
+            logger.info(f"[DEBUG] MIDDLEWARE - Request received: {method} {path}")
+
         start_time = time.perf_counter()
 
         # Process the request
         response = await call_next(request)
+
+        # Log after processing for debugging hangs
+        if "/upload" in path or "/models/video" in path:
+            logger.info(f"[DEBUG] MIDDLEWARE - Request completed: {method} {path} in {(time.perf_counter() - start_time):.3f}s")
 
         # Calculate processing time
         process_time = time.perf_counter() - start_time

@@ -162,6 +162,59 @@ class RunPodClient:
             logger.error(error_msg, exc_info=True)
             return RunPodResponse(success=False, error=error_msg)
 
+    async def check_gpu_availability(self, gpu_type: str = "NVIDIA RTX 5090") -> bool:
+        """
+        Check if specified GPU is available on RunPod.
+
+        Uses the endpoint health check API to determine worker availability.
+
+        Args:
+            gpu_type: The GPU type to check for (default: "NVIDIA RTX 5090")
+
+        Returns:
+            True if GPU workers are available, False otherwise
+        """
+        if not self.api_key or not self.endpoint_id:
+            logger.warning("RunPod credentials not configured, GPU check returning False")
+            return False
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    f"{self.base_url}/health",
+                    headers=self._get_headers(),
+                )
+
+                if response.status_code != 200:
+                    logger.warning(
+                        f"RunPod health check failed: {response.status_code} - {response.text}"
+                    )
+                    return False
+
+                data = response.json()
+
+                # Check worker availability from health response
+                # Health endpoint returns: { "workers": { "ready": N, "running": N, "idle": N } }
+                workers = data.get("workers", {})
+                ready_workers = workers.get("ready", 0)
+                idle_workers = workers.get("idle", 0)
+
+                available = ready_workers > 0 or idle_workers > 0
+
+                logger.info(
+                    f"RunPod health check: ready={ready_workers}, idle={idle_workers}, "
+                    f"available={available}"
+                )
+
+                return available
+
+        except httpx.TimeoutException:
+            logger.warning("RunPod health check timed out")
+            return False
+        except Exception as e:
+            logger.warning(f"RunPod health check failed: {str(e)}")
+            return False
+
     async def check_job_status(self, job_id: str) -> RunPodResponse:
         """
         Check the status of a RunPod job (for async jobs).

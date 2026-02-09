@@ -71,3 +71,37 @@ MAX_PAGE_SIZE = 100
 MINUTES_PER_ADDITIONAL_PURCHASE = 20
 COST_PER_ADDITIONAL_PURCHASE_JPY = 1000
 STANDARD_PLAN_MONTHLY_MINUTES = 100
+
+# Plan configuration
+PLAN_CONFIG = {
+    "free": {
+        "minutes": 3,
+        "video_trainings": 1,
+        "voice_trainings": 1,
+        "price_jpy": 0,
+        "is_lifetime": True,  # Minutes and trainings never reset
+    },
+    "standard": {
+        "minutes": 100,
+        "video_trainings": 5,
+        "voice_trainings": 5,
+        "price_jpy": 2980,
+        "is_lifetime": False,
+    },
+    "shot": {
+        "minutes": 10,
+        "video_trainings": 1,
+        "voice_trainings": 1,
+        "price_jpy": 980,
+        "never_expires": True,  # One-time purchase, credits never expire
+    },
+}
+
+# Auto-charge configuration (for Standard plan)
+AUTO_CHARGE_MINUTES = 20
+AUTO_CHARGE_PRICE_JPY = 1000
+AUTO_CHARGE_BONUS_TRAININGS = 1  # Bonus training per auto-charge
+
+# Model creation limits (legacy - now managed via PLAN_CONFIG)
+MAX_VIDEO_MODELS_PER_USER = 5
+MAX_VOICE_MODELS_PER_USER = 5

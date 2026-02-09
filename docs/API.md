@@ -57,8 +57,9 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 |--------|------|-------------|
 | GET | `/models/video` | List video models (paginated) |
 | GET | `/models/video/{id}` | Get video model by ID |
-| POST | `/models/video` | Create video model, get upload URL |
-| POST | `/models/video/{id}/upload-complete` | Mark upload done, start processing |
+| POST | `/models/video` | Create video model, get presigned upload URL |
+| POST | `/models/video/upload` | **Direct upload** - upload file directly to server |
+| POST | `/models/video/{id}/upload-complete` | Mark presigned upload done, start processing |
 | PATCH | `/models/video/{id}` | Update model name |
 | DELETE | `/models/video/{id}` | Delete video model |
 
@@ -80,19 +81,26 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 |--------|------|-------------|
 | GET | `/models/voice` | List voice models (paginated) |
 | GET | `/models/voice/{id}` | Get voice model by ID |
-| POST | `/models/voice` | Create voice model, get upload URL |
-| POST | `/models/voice/{id}/upload-complete` | Mark upload done, start processing |
+| POST | `/models/voice` | Create voice model, get presigned upload URL |
+| POST | `/models/voice/upload` | **Direct upload** - upload file directly to server |
+| POST | `/models/voice/{id}/upload-complete` | Mark presigned upload done, start processing |
 | PATCH | `/models/voice/{id}` | Update model name |
 | DELETE | `/models/voice/{id}` | Delete voice model |
 
 **Query Params (GET list):** `status`, `source_type`, `page`, `limit`
 
-**Create Request:**
+**Create Request (presigned URL flow):**
 - `name` - Display name (1-100 chars)
 - `file_name` - Original filename
 - `file_size_bytes` - File size (max 100MB)
 - `content_type` - "audio/mpeg", "audio/wav", "audio/mp4", "audio/webm", etc.
 - `source_type` - "upload" or "recording"
+
+**Direct Upload (multipart form):**
+- `file` - Audio file (max 100MB)
+- `name` - Display name (1-100 chars)
+- `duration_seconds` - Audio duration in seconds
+- `source_type` - "upload" or "recording" (default: "upload")
 
 ---
 
@@ -129,18 +137,19 @@ Authorization: Bearer <FIREBASE_ID_TOKEN>
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/videos` | List generated videos (paginated) |
-| GET | `/videos/{id}` | Get video details |
-| GET | `/videos/{id}/download` | Get presigned download URL |
+| GET | `/videos` | List generated videos (paginated, includes video URLs) |
+| GET | `/videos/{id}` | Get video details with fresh presigned URL |
+| GET | `/videos/{id}/download` | Get presigned download URL (avoids CORS) |
 | DELETE | `/videos/{id}` | Delete generated video |
 | POST | `/videos/{id}/regenerate` | Regenerate with same settings |
 
 **Query Params (GET list):** `status_filter`, `video_model_id`, `voice_model_id`, `sort`, `order`, `page`, `limit`
 
-**Download Response:**
-- `download_url` - Presigned S3 URL
-- `file_name` - Suggested filename
-- `expires_in_seconds` - URL expiration time
+**Video URLs:**
+- `output_video_url` - Presigned S3 URL (included in list and detail responses)
+- URLs are generated on-demand and expire in 1 hour
+- Use `<video src="url">` for streaming
+- Use `/download` endpoint for downloading (returns `download_url`, `file_name`)
 
 ---
 

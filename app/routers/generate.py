@@ -13,7 +13,12 @@ from app.models.voice_model import ModelStatus as VoiceModelStatus
 from app.models.generated_video import GenerationStatus
 from app.services.firebase import get_current_user
 from app.services.ai import ai_service
+from app.services.s3 import s3_service
 from app.services.usage_service import usage_service
+from app.services.progress import (
+    calculate_generated_video_progress,
+    VIDEO_GENERATION_ESTIMATED_DURATION,
+)
 from app.schemas.generated_video import (
     GenerateVideoRequest,
     GenerateVideoResponse,
@@ -109,7 +114,10 @@ async def generate_video(
     )
     queue_position = len(queue_result.scalars().all()) + 1
 
-    # Create generated video record
+    # Get current usage record for response (no deduction yet - will deduct after generation)
+    usage_record = await usage_service.get_or_create_current_usage(user.id, db)
+
+    # Create generated video record (credits_used will be set after generation completes)
     generated_video = GeneratedVideo(
         user_id=user.id,
         video_model_id=data.video_model_id,
@@ -118,16 +126,13 @@ async def generate_video(
         input_text=data.input_text,
         input_text_language=data.language,
         resolution=data.resolution,
-        credits_used=credits_needed,
+        credits_used=0,  # Will be updated with actual duration after generation
         status=GenerationStatus.QUEUED.value,
         queue_position=queue_position,
     )
     db.add(generated_video)
     await db.commit()
     await db.refresh(generated_video)
-
-    # Deduct credits
-    usage_record = await usage_service.deduct_credits(user.id, credits_needed, db)
 
     # Start generation in background
     background_tasks.add_task(
@@ -145,7 +150,7 @@ async def generate_video(
             status=generated_video.status,
             queue_position=generated_video.queue_position,
             estimated_duration_seconds=estimated_duration,
-            credits_used=generated_video.credits_used,
+            credits_used=credits_needed,  # Estimated - actual will be based on output duration
             created_at=generated_video.created_at,
         ),
         usage=UsageInfo(
@@ -174,7 +179,10 @@ async def get_generation_status(
     Get current generation status.
 
     Used for polling during video generation.
+    Uses simulated progress based on elapsed time for smooth updates.
     """
+    from datetime import datetime
+
     result = await db.execute(
         select(GeneratedVideo).where(
             GeneratedVideo.id == video_id,
@@ -189,22 +197,45 @@ async def get_generation_status(
             detail="Generated video not found",
         )
 
-    # Estimate remaining time if processing
+    # Calculate simulated progress based on elapsed time
+    # This provides smooth 1% increments during worker mode processing
+    progress_percent, processing_stage = calculate_generated_video_progress(
+        status=video.status,
+        processing_started_at=video.processing_started_at,
+        stored_progress=video.progress_percent or 0,
+        stored_stage=video.processing_stage or "queued",
+        input_text=video.input_text,
+    )
+
+    # Calculate estimated remaining time based on actual elapsed time
     estimated_remaining = None
-    if video.status == GenerationStatus.PROCESSING.value and video.progress_percent:
-        # Rough estimate based on progress
-        if video.progress_percent > 0:
-            elapsed = 10  # Assume ~10 seconds have passed
-            estimated_remaining = int(elapsed * (100 - video.progress_percent) / video.progress_percent)
+    if video.status == GenerationStatus.PROCESSING.value and video.processing_started_at:
+        elapsed = (datetime.utcnow() - video.processing_started_at).total_seconds()
+        # Estimate total duration based on progress (cap at 78% for estimation)
+        if progress_percent > 0 and progress_percent < 78:
+            estimated_total = (elapsed / progress_percent) * 100
+            estimated_remaining = max(0, int(estimated_total - elapsed))
+        elif progress_percent >= 78:
+            # Near completion, show small remaining time
+            estimated_remaining = 30
+
+    # Generate presigned URL for completed videos
+    output_video_url = None
+    if video.status == GenerationStatus.COMPLETED.value and video.output_video_key:
+        try:
+            output_video_url = await s3_service.generate_presigned_url(video.output_video_key)
+        except Exception:
+            pass
 
     return GenerationStatusResponse(
         video=GenerationStatusDetail(
             id=video.id,
             status=video.status,
+            processing_stage=processing_stage,
             queue_position=video.queue_position,
-            progress_percent=video.progress_percent,
+            progress_percent=progress_percent,
             estimated_remaining_seconds=estimated_remaining,
-            output_video_url=video.output_video_url,
+            output_video_url=output_video_url,
             thumbnail_url=video.thumbnail_url,
             duration_seconds=video.duration_seconds,
             file_size_bytes=video.file_size_bytes,

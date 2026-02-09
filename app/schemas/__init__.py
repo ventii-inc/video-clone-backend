@@ -13,18 +13,17 @@ from app.schemas.profile import (
     ProfileUpdate,
 )
 from app.schemas.video_model import (
-    VideoModelCreate,
     VideoModelResponse,
     VideoModelListResponse,
     VideoModelUpdate,
-    UploadCompleteRequest,
-    UploadInfo,
+    DirectUploadResponse,
 )
 from app.schemas.voice_model import (
     VoiceModelCreate,
     VoiceModelResponse,
     VoiceModelListResponse,
     VoiceModelUpdate,
+    DirectVoiceUploadResponse,
 )
 from app.schemas.generated_video import (
     GenerateVideoRequest,
@@ -52,6 +51,15 @@ from app.schemas.avatar_job import (
     JobQueueStatusResponse,
     RetryJobResponse,
 )
+from app.schemas.worker import (
+    AvatarJobRequest,
+    VideoJobRequest,
+    WorkerHealthResponse,
+    WorkerCapacityResponse,
+    JobSubmitResponse,
+    JobProgressCallback,
+    JobCompletionCallback,
+)
 
 __all__ = [
     # Common
@@ -67,17 +75,16 @@ __all__ = [
     "ProfileResponse",
     "ProfileUpdate",
     # Video Model
-    "VideoModelCreate",
     "VideoModelResponse",
     "VideoModelListResponse",
     "VideoModelUpdate",
-    "UploadCompleteRequest",
-    "UploadInfo",
+    "DirectUploadResponse",
     # Voice Model
     "VoiceModelCreate",
     "VoiceModelResponse",
     "VoiceModelListResponse",
     "VoiceModelUpdate",
+    "DirectVoiceUploadResponse",
     # Generated Video
     "GenerateVideoRequest",
     "GeneratedVideoResponse",
@@ -100,4 +107,12 @@ __all__ = [
     "AvatarJobResponse",
     "JobQueueStatusResponse",
     "RetryJobResponse",
+    # Worker
+    "AvatarJobRequest",
+    "VideoJobRequest",
+    "WorkerHealthResponse",
+    "WorkerCapacityResponse",
+    "JobSubmitResponse",
+    "JobProgressCallback",
+    "JobCompletionCallback",
 ]

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, Integer, String
 from sqlalchemy.orm import relationship
 
 from app.db.database import Base
@@ -18,6 +18,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False, index=True)
     name = Column(String, nullable=True)
     avatar_url = Column(String(500), nullable=True)
+    bypass_model_limit = Column(Boolean, default=False, nullable=False)  # Bypass 5 model limit
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
@@ -31,6 +32,7 @@ class User(Base):
     voice_models = relationship("VoiceModel", back_populates="user", cascade="all, delete-orphan")
     generated_videos = relationship("GeneratedVideo", back_populates="user", cascade="all, delete-orphan")
     usage_records = relationship("UsageRecord", back_populates="user", cascade="all, delete-orphan")
+    training_usage_records = relationship("TrainingUsageRecord", back_populates="user", cascade="all, delete-orphan")
     payment_history = relationship("PaymentHistory", back_populates="user", cascade="all, delete-orphan")
     avatar_jobs = relationship("AvatarJob", back_populates="user", cascade="all, delete-orphan")
 

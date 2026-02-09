@@ -14,6 +14,8 @@ from app.db.database import Base
 class PaymentType(str, PyEnum):
     SUBSCRIPTION = "subscription"
     ADDITIONAL_MINUTES = "additional_minutes"
+    SHOT_PLAN = "shot_plan"
+    AUTO_CHARGE = "auto_charge"
 
 
 class PaymentStatus(str, PyEnum):
