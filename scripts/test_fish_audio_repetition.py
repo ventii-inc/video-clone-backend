@@ -10,6 +10,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -198,7 +199,8 @@ def main():
         print(f"\nTranscript:\n  {transcript}")
 
         print("\nChecking for repetition...")
-        has_repetition, repeated_phrases = detect_repetition(args.text, transcript, gemini_client)
+        transcript_clean = re.sub(r'[\s\u3000]+', '', transcript)
+        has_repetition, repeated_phrases = detect_repetition(args.text, transcript_clean, gemini_client)
         results.append(has_repetition)
 
         if has_repetition:

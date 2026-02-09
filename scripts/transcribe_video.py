@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -125,7 +126,9 @@ def main():
 
         original = args.text if args.text else transcript
         print("\nChecking for repetition...")
-        has_repetition, repeated_phrases = detect_repetition(original, transcript, gemini_client)
+        transcript_clean = re.sub(r'[\s\u3000]+', '', transcript)
+        original_clean = re.sub(r'[\s\u3000]+', '', original)
+        has_repetition, repeated_phrases = detect_repetition(original_clean, transcript_clean, gemini_client)
         if has_repetition:
             print("  REPEATED phrases found:")
             for r in repeated_phrases:
